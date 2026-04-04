@@ -10,6 +10,11 @@ from ai_service import analyze_with_gemini, generate_staged_photos
 from pdf_service import generate_pdf
 from email_service import send_report_email
 
+allow_origins=[
+    "http://localhost:5173",
+    "staged-ai-six.vercel.app",  # ← il tuo URL Vercel reale
+]
+
 app = FastAPI(title="HomeStager AI")
 
 # Update allow_origins with your Vercel URL after first deploy
