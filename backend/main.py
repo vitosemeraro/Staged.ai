@@ -13,7 +13,7 @@ from email_service import send_report_email
 allow_origins=[
     "http://localhost:5173",
     "staged-ai-six.vercel.app",  # ← il tuo URL Vercel reale
-]
+],
 
 app = FastAPI(title="HomeStager AI")
 
