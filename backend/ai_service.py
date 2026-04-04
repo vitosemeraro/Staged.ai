@@ -31,7 +31,8 @@ LOCATION        = os.environ.get("GCP_LOCATION", "us-central1")
 REPLICATE_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "")
 
 # Nuovo SDK per Gemini 2.0
-_genai_client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
+_gemini_api_key = os.environ["GEMINI_API_KEY"]
+_genai_client = genai.Client(api_key=_gemini_api_key)
 
 # Vecchio SDK necessario solo per Imagen 3
 vertexai.init(project=PROJECT_ID, location=LOCATION)
