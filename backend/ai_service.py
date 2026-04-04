@@ -252,7 +252,7 @@ Restituisci SOLO questo JSON:
 }}"""
 
     response = _genai_client.models.generate_content(
-        model="gemini-2.0-flash-001",
+        model="gemini-2.0-flash",
         contents=image_parts + [types.Part.from_text(text=prompt)],
         config=types.GenerateContentConfig(
             system_instruction=system_instruction,
