@@ -14,9 +14,11 @@ import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 
-import vertexai
-from vertexai.generative_models import GenerativeModel, Part
+from google import genai
+from google.genai import types
 from vertexai.preview.vision_models import ImageGenerationModel, Image as VisionImage
+
+
 
 try:
     from PIL import Image as PILImage
@@ -29,7 +31,7 @@ PROJECT_ID      = os.environ["GCP_PROJECT_ID"]
 LOCATION        = os.environ.get("GCP_LOCATION", "us-central1")
 REPLICATE_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "")
 
-vertexai.init(project=PROJECT_ID, location=LOCATION)
+_genai_client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
 
 # Executor separati: Gemini è I/O bound con poca concorrenza per job,
 # Imagen gira in parallelo per ogni stanza e beneficia di più thread.
