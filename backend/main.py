@@ -10,10 +10,6 @@ from ai_service import analyze_with_gemini, generate_staged_photos
 from pdf_service import generate_pdf
 from email_service import send_report_email
 
-allow_origins=[
-    "http://localhost:5173",
-    "staged-ai-six.vercel.app",  # ← il tuo URL Vercel reale
-],
 
 app = FastAPI(title="HomeStager AI")
 
@@ -22,8 +18,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
-        "http://localhost:3000",
-        # "https://your-project.vercel.app",  # <-- uncomment and set after Vercel deploy
+        "https://staged-ai-six.vercel.app,
     ],
     allow_methods=["*"],
     allow_headers=["*"],
