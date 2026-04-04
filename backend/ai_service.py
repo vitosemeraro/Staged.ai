@@ -170,7 +170,7 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
     }
 
     model = GenerativeModel(
-        "gemini-2.0-flash-001",
+         "gemini-2.0-flash-001",
         system_instruction=(
             "Sei un esperto consulente di home staging e interior design italiano, "
             "specializzato in affitti brevi e case vacanza. "
