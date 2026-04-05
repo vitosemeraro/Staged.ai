@@ -324,7 +324,7 @@ Restituisci SOLO questo JSON (costi come interi):
     text = response.text.strip()
     try:
         return json.loads(text)
-        except json.JSONDecodeError:
+    except json.JSONDecodeError:
         return _extract_json(text)  # fallback robusto
 
 
