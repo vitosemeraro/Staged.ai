@@ -285,7 +285,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <span class="shop-budget">€{{ cat.budget_stimato }}</span>
       </div>
       <div class="shop-store">{{ cat.negozi_consigliati }}</div>
-      {% for item in cat.items %}
+      {% for item in cat.articoli %}
       <div class="shop-item">{{ item }}</div>
       {% endfor %}
     </div>
