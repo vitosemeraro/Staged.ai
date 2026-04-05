@@ -255,7 +255,7 @@ Restituisci SOLO questo JSON (costi come interi):
         }}
       ],
       "costo_totale_stanza": 350,
-      "prompt_imagen": "Photorealistic interior photo, WIDE ANGLE full room view shot from doorway/corner showing entire room, {style} style, same walls same windows same ceiling same floor preserved, [ONLY elements covered by budget interventions are changed: new furniture/textiles/decor matching {style}], warm natural light, professional architectural photography, 24mm wide angle lens, magazine quality 4k",
+      "prompt_imagen": "Photorealistic interior photo, {style} style, EXACT SAME CAMERA ANGLE AND PERSPECTIVE as the original photo, EXACT SAME ROOM GEOMETRY: same walls same windows same ceiling same floor same viewpoint, only replace [elements covered by budget interventions] with {style} alternatives, warm natural light, magazine quality 4k",
       "negative_prompt_imagen": "do not modify: walls, ceiling, floor, windows, window frames, doors, door frames, radiators, room geometry, room proportions, [list here all structural elements NOT covered by the interventions above, e.g. kitchen cabinets if not in budget]"
     }}
   ],
