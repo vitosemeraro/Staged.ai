@@ -2,7 +2,7 @@
 AI Service v3
 - Gemini 2.5 Flash via API key (google-genai SDK)
 - Imagen 3 inpainting per le foto staged (via vertexai SDK)
-  NOTE: Imagen 3 deprecato il 24/06/2026 — migrare a Gemini Image quando disponibile
+  NOTE: Imagen 3 deprecato il 24/06/2026 — migrare a Gemini Image quando stabile
 - validate_and_fix_costs(): validazione matematica budget post-Gemini
 - compress_image(): compressione foto per PDF < 8MB
 """
@@ -28,21 +28,24 @@ except ImportError:
     HAS_PIL = False
     print("[WARNING] Pillow non installato — compressione immagini disabilitata")
 
-PROJECT_ID       = os.environ["GCP_PROJECT_ID"]
-LOCATION         = os.environ.get("GCP_LOCATION", "us-central1")
-GEMINI_API_KEY   = os.environ["GEMINI_API_KEY"]
-REPLICATE_TOKEN  = os.environ.get("REPLICATE_API_TOKEN", "")
+PROJECT_ID      = os.environ["GCP_PROJECT_ID"]
+LOCATION        = os.environ.get("GCP_LOCATION", "us-central1")
+GEMINI_API_KEY  = os.environ["GEMINI_API_KEY"]
+REPLICATE_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "")
 
-# Gemini: usa API key diretta (non Vertex AI)
 _genai_client = genai.Client(api_key=GEMINI_API_KEY)
-
-# Imagen 3: usa ancora vertexai SDK
 vertexai.init(project=PROJECT_ID, location=LOCATION)
 
 _gemini_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="gemini")
 _imagen_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="imagen")
 
 _analysis_cache: dict[str, dict] = {}
+
+
+# ── Placeholder coroutine (sostituisce async def _none() dentro loop) ─────────
+
+async def _noop():
+    return None
 
 
 # ── Utilità: compressione foto ────────────────────────────────────────────────
@@ -63,33 +66,38 @@ def compress_image(img_bytes: bytes, max_width: int = 1400, quality: int = 82) -
         return img_bytes
 
 
+def _cache_key(photos: list, prefs: dict) -> str:
+    h = hashlib.md5()
+    for p in photos:
+        h.update(p["content"])
+    h.update(prefs.get("style", "").encode())
+    h.update(str(prefs.get("budget", 0)).encode())
+    h.update(prefs.get("location", "").encode())
+    return h.hexdigest()
+
 
 def _extract_json(text: str) -> dict:
     """
     Estrae JSON robusto dalla risposta di Gemini.
     Gestisce: backtick markdown, testo prima/dopo il JSON, JSON troncato.
     """
-    # Rimuovi eventuali fence markdown
     text = re.sub(r"^```(?:json)?\s*", "", text.strip())
     text = re.sub(r"\s*```\s*$", "", text)
     text = text.strip()
 
-    # Prova parsing diretto
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Estrai il blocco JSON più grande (da { a })
     start = text.find("{")
     if start == -1:
         raise ValueError(f"Nessun JSON trovato nella risposta Gemini: {text[:200]}")
 
-    # Trova la chiusura bilanciata
     depth = 0
-    end   = -1
+    end = -1
     in_string = False
-    escape    = False
+    escape = False
     for i, ch in enumerate(text[start:], start=start):
         if escape:
             escape = False
@@ -111,35 +119,21 @@ def _extract_json(text: str) -> dict:
                 break
 
     if end == -1:
-        # JSON troncato — tenta riparazione aggiungendo chiusure mancanti
         candidate = text[start:]
         open_braces   = candidate.count("{") - candidate.count("}")
         open_brackets = candidate.count("[") - candidate.count("]")
-        repair = ("}" * open_brackets) + ("]" * open_braces)  # nota: ordine inverso
-        # Riparazione corretta
         repair = ("]" * open_brackets) + ("}" * open_braces)
         candidate = candidate + repair
         try:
             result = json.loads(candidate)
-            print(f"[_extract_json] JSON riparato dopo troncatura ({open_braces} chiusure aggiunte)")
+            print(f"[_extract_json] JSON riparato ({open_braces} chiusure aggiunte)")
             return result
         except json.JSONDecodeError as e:
             raise ValueError(
-                f"JSON troncato e non riparabile. "
-                f"Aumentare max_output_tokens o ridurre il numero di stanze. "
-                f"Errore: {e}"
+                f"JSON troncato e non riparabile. Errore: {e}"
             )
 
     return json.loads(text[start:end])
-
-def _cache_key(photos: list, prefs: dict) -> str:
-    h = hashlib.md5()
-    for p in photos:
-        h.update(p["content"])
-    h.update(prefs.get("style", "").encode())
-    h.update(str(prefs.get("budget", 0)).encode())
-    h.update(prefs.get("location", "").encode())
-    return h.hexdigest()
 
 
 # ── Validazione costi post-Gemini ─────────────────────────────────────────────
@@ -148,7 +142,6 @@ def validate_and_fix_costs(analysis: dict, budget: int) -> dict:
     stanze = analysis.get("stanze", [])
     rc     = analysis.setdefault("riepilogo_costi", {})
 
-    # Invariante 1: costo_min <= costo_max
     for room in stanze:
         for iv in room.get("interventi", []):
             cmin = iv.get("costo_min", 0)
@@ -156,7 +149,6 @@ def validate_and_fix_costs(analysis: dict, budget: int) -> dict:
             if cmin > cmax:
                 iv["costo_min"], iv["costo_max"] = cmax, cmin
 
-    # Invariante 2+3: somma stanze == totale dichiarato <= budget
     totale_stanze     = sum(r.get("costo_totale_stanza", 0) for r in stanze)
     totale_dichiarato = rc.get("totale", 0)
     totale_reale      = max(totale_stanze, totale_dichiarato)
@@ -224,12 +216,13 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "Nessun testo prima o dopo. Nessun markdown. Nessun backtick."
     )
 
-    image_parts = [
+    # FIX: usa types.Part(text=...) invece di types.Part.from_text(text=...)
+    # Il nuovo SDK google-genai non ha from_text come metodo statico
+    contents = [
         types.Part.from_bytes(data=p["content"], mime_type=p["content_type"])
         for p in photos
     ]
-
-    prompt = f"""Analizza queste {len(photos)} foto di un appartamento e produci
+    contents.append(types.Part(text=f"""Analizza queste {len(photos)} foto di un appartamento e produci
 una scheda professionale di home staging per {dest_label}.
 
 PARAMETRI:
@@ -241,10 +234,10 @@ PARAMETRI:
 REGOLE PREZZI:
 - Usa prezzi reali di {location}.
 - Distribuzione consigliata:
-    Arredi e complementi:       €{alloc['arredi']} (~40%)
-    Tinteggiatura manodopera:   €{alloc['tinteggiatura']} (~30%)
-    Materiali pittura/accessori:€{alloc['materiali']} (~20%)
-    Montaggio e imprevisti:     €{alloc['montaggio']} (~10%)
+    Arredi e complementi:        €{alloc['arredi']} (~40%)
+    Tinteggiatura manodopera:    €{alloc['tinteggiatura']} (~30%)
+    Materiali pittura/accessori: €{alloc['materiali']} (~20%)
+    Montaggio e imprevisti:      €{alloc['montaggio']} (~10%)
 
 REGOLA MATEMATICA CRITICA:
 SOMMA(costo_totale_stanza) deve essere <= {budget}.
@@ -284,7 +277,7 @@ Restituisci SOLO questo JSON (costi come interi):
         }}
       ],
       "costo_totale_stanza": 350,
-      "prompt_imagen": "Photorealistic interior photo after home staging, {style} interior design style, [room name], PRESERVED: same walls, same windows, same ceiling, same floor material, CHANGED: [specific new furniture with exact colors/materials matching {style}], [specific textiles: rug pattern/color, curtain material, cushion colors all matching {style}], [specific decorative objects typical of {style}], warm natural light from existing windows, professional architectural photography, 35mm wide angle lens, shot from corner, magazine quality 4k"
+      "prompt_imagen": "Photorealistic interior photo after home staging, {style} style, same room geometry preserved: same walls same windows same ceiling same floor, [specific new furniture colors/materials matching {style}], [specific textiles matching {style}], [specific decorative objects typical of {style}], warm natural light, professional architectural photography, 35mm wide angle lens, shot from corner, magazine quality 4k"
     }}
   ],
   "riepilogo_costi": {{
@@ -307,30 +300,28 @@ Restituisci SOLO questo JSON (costi come interi):
   "titolo_annuncio_suggerito": "Titolo Airbnb max 50 caratteri per {location}",
   "highlights_str": ["highlight 1", "highlight 2", "highlight 3"],
   "roi_restyling": "ROI: investimento €X, +€Y/notte, break-even Z notti (~N mesi al 60% occupazione)"
-}}"""
+}}"""))
 
     response = _genai_client.models.generate_content(
         model="gemini-2.5-flash",
-        contents=image_parts + [types.Part.from_text(text=prompt)],
+        contents=contents,
         config=types.GenerateContentConfig(
-        system_instruction=system_instruction,
-        temperature=0.2,
-        max_output_tokens=16384,
-        response_mime_type="application/json",
-      ),
+            system_instruction=system_instruction,
+            temperature=0.2,
+            max_output_tokens=16384,
+            response_mime_type="application/json",
+        ),
     )
 
-    # Con response_mime_type="application/json" la risposta è JSON garantito
     text = response.text.strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        return _extract_json(text)  # fallback robusto
+        return _extract_json(text)
 
 
 # ── Imagen 3 — staged photos (parallelo) ─────────────────────────────────────
 # NOTA: Imagen 3 sarà deprecato il 24/06/2026.
-# Migrare a gemini-2.5-flash-image quando stabile.
 
 async def generate_staged_photos(photos: list, analysis: dict) -> list:
     stanze         = analysis.get("stanze", [])
@@ -349,9 +340,8 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
         elif prompt:
             tasks.append(loop.run_in_executor(_imagen_executor, _imagen_generate_sync, prompt))
         else:
-            async def _none():
-                return None
-            tasks.append(_none())
+            # FIX: _noop() definita fuori dal loop, non dentro
+            tasks.append(_noop())
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     output  = []
