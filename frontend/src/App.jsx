@@ -239,8 +239,11 @@ function ProcessingStep({ job }) {
           <div style={{ height: "100%", background: "var(--color-text-primary)", borderRadius: 2, width: `${job?.progress || 0}%`, transition: "width 0.6s ease" }} />
         </div>
         {steps.map((step, i) => {
-          const done = (job?.progress || 0) > (i + 1) * 18;
-          const active = !done && (job?.progress || 0) > i * 18;
+          // Thresholds corrispondono ai valori reali di progress del backend:
+          // 10=Gemini, 35=Imagen, 70=Scheda, 80=PDF, 92=Email, 100=Done
+          const THRESHOLDS = [10, 35, 70, 80, 92, 100];
+          const done   = (job?.progress || 0) >= THRESHOLDS[i + 1];
+          const active = !done && (job?.progress || 0) >= THRESHOLDS[i];
           return (
             <div key={i} style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 8, opacity: done || active ? 1 : 0.3 }}>
               <div style={{ width: 16, height: 16, borderRadius: "50%", background: done ? "var(--color-text-success)" : active ? "var(--color-text-primary)" : "var(--color-border-secondary)", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -308,7 +311,9 @@ export default function App() {
         setJobStatus(data);
         if (data.status === "completed") {
           clearInterval(pollRef.current);
-          setStep(4);
+          // Mostra tutti gli step completati per 1.5s prima di passare alla schermata finale
+          setJobStatus({ ...data, progress: 100 });
+          setTimeout(() => setStep(4), 1500);
         } else if (data.status === "error") {
           clearInterval(pollRef.current);
           setError(`Errore: ${data.error}`);
