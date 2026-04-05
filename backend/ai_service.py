@@ -63,6 +63,75 @@ def compress_image(img_bytes: bytes, max_width: int = 1400, quality: int = 82) -
         return img_bytes
 
 
+
+def _extract_json(text: str) -> dict:
+    """
+    Estrae JSON robusto dalla risposta di Gemini.
+    Gestisce: backtick markdown, testo prima/dopo il JSON, JSON troncato.
+    """
+    # Rimuovi eventuali fence markdown
+    text = re.sub(r"^```(?:json)?\s*", "", text.strip())
+    text = re.sub(r"\s*```\s*$", "", text)
+    text = text.strip()
+
+    # Prova parsing diretto
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Estrai il blocco JSON più grande (da { a })
+    start = text.find("{")
+    if start == -1:
+        raise ValueError(f"Nessun JSON trovato nella risposta Gemini: {text[:200]}")
+
+    # Trova la chiusura bilanciata
+    depth = 0
+    end   = -1
+    in_string = False
+    escape    = False
+    for i, ch in enumerate(text[start:], start=start):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+
+    if end == -1:
+        # JSON troncato — tenta riparazione aggiungendo chiusure mancanti
+        candidate = text[start:]
+        open_braces   = candidate.count("{") - candidate.count("}")
+        open_brackets = candidate.count("[") - candidate.count("]")
+        repair = ("}" * open_brackets) + ("]" * open_braces)  # nota: ordine inverso
+        # Riparazione corretta
+        repair = ("]" * open_brackets) + ("}" * open_braces)
+        candidate = candidate + repair
+        try:
+            result = json.loads(candidate)
+            print(f"[_extract_json] JSON riparato dopo troncatura ({open_braces} chiusure aggiunte)")
+            return result
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"JSON troncato e non riparabile. "
+                f"Aumentare max_output_tokens o ridurre il numero di stanze. "
+                f"Errore: {e}"
+            )
+
+    return json.loads(text[start:end])
+
 def _cache_key(photos: list, prefs: dict) -> str:
     h = hashlib.md5()
     for p in photos:
@@ -246,14 +315,12 @@ Restituisci SOLO questo JSON (costi come interi):
         config=types.GenerateContentConfig(
             system_instruction=system_instruction,
             temperature=0.2,
-            max_output_tokens=4096,
+            max_output_tokens=8192,  # aumentato: JSON con 5+ stanze supera 4096
         ),
     )
 
     text = response.text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```\s*$", "", text)
-    return json.loads(text.strip())
+    return _extract_json(text)
 
 
 # ── Imagen 3 — staged photos (parallelo) ─────────────────────────────────────
