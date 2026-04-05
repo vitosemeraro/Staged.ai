@@ -259,7 +259,7 @@ Restituisci SOLO questo JSON (costi come interi):
   "piano_acquisti": [
     {{
       "categoria": "Tessili",
-      "items": ["item per {style}"],
+      "articoli": ["item per {style}"],
       "budget_stimato": 0,
       "negozi_consigliati": "negozi per {style}"
     }}
