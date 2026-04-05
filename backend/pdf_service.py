@@ -72,7 +72,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .photos-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:26px; }
   .photo-label { font-size:8pt; text-transform:uppercase; letter-spacing:1.5px;
                  color:#888; margin-bottom:5px; }
-  .room-photo { width:100%; height:185px; object-fit:cover; border-radius:6px; display:block; }
+  .room-photo { width:100%; max-height:220px; object-fit:contain; background:#f5f5f3; border-radius:6px; display:block; }
   .photo-placeholder { width:100%; height:185px; background:#f0eeea; border-radius:6px;
                        display:flex; align-items:center; justify-content:center;
                        font-size:9pt; color:#bbb; }
@@ -218,7 +218,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       {% endif %}
     </div>
     <div>
-      <div class="photo-label">Dopo — staging AI</div>
+      <div class="photo-label">Dopo — simulazione AI (la disposizione reale può variare)</div>
       {% if room.staged_photo_b64 %}
       <img class="room-photo"
            src="data:image/png;base64,{{ room.staged_photo_b64 }}"
@@ -285,7 +285,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <span class="shop-budget">€{{ cat.budget_stimato }}</span>
       </div>
       <div class="shop-store">{{ cat.negozi_consigliati }}</div>
-      {% for item in cat.articoli %}
+      {% for item in cat.items %}
       <div class="shop-item">{{ item }}</div>
       {% endfor %}
     </div>
