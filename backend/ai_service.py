@@ -1,10 +1,8 @@
 """
-AI Service v4
-- Gemini 2.5 Flash via API key (google-genai SDK)
-- Contents passati come dizionari raw — evita problemi di compatibilità SDK
-- Imagen 3 inpainting per le foto staged (via vertexai SDK)
-- validate_and_fix_costs(): validazione matematica budget
-- compress_image(): compressione foto per PDF < 8MB
+AI Service v5
+- Gemini 2.5 Flash via REST API diretta (httpx) — bypassa SDK google-genai
+- Imagen 3 inpainting via vertexai SDK
+- validate_and_fix_costs(), compress_image(), _extract_json()
 """
 import asyncio
 import base64
@@ -15,9 +13,7 @@ import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 
-from google import genai
-from google.genai import types
-
+import httpx
 import vertexai
 from vertexai.preview.vision_models import ImageGenerationModel, Image as VisionImage
 
@@ -33,7 +29,12 @@ LOCATION        = os.environ.get("GCP_LOCATION", "us-central1")
 GEMINI_API_KEY  = os.environ["GEMINI_API_KEY"]
 REPLICATE_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "")
 
-_genai_client = genai.Client(api_key=GEMINI_API_KEY)
+# URL REST API Gemini — nessun SDK, nessun problema di versione
+GEMINI_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+)
+
 vertexai.init(project=PROJECT_ID, location=LOCATION)
 
 _gemini_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="gemini")
@@ -41,8 +42,6 @@ _imagen_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="imagen"
 
 _analysis_cache: dict[str, dict] = {}
 
-
-# ── Coroutine placeholder (non definita dentro il loop) ───────────────────────
 
 async def _noop():
     return None
@@ -79,16 +78,13 @@ def _cache_key(photos: list, prefs: dict) -> str:
 def _extract_json(text: str) -> dict:
     text = re.sub(r"^```(?:json)?\s*", "", text.strip())
     text = re.sub(r"\s*```\s*$", "", text).strip()
-
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-
     start = text.find("{")
     if start == -1:
         raise ValueError(f"Nessun JSON nella risposta: {text[:300]}")
-
     depth = 0
     end = -1
     in_string = False
@@ -112,19 +108,15 @@ def _extract_json(text: str) -> dict:
             if depth == 0:
                 end = i + 1
                 break
-
     if end == -1:
         candidate = text[start:]
-        ob = candidate.count("{") - candidate.count("}")
+        ob  = candidate.count("{") - candidate.count("}")
         ob2 = candidate.count("[") - candidate.count("]")
         candidate += ("]" * ob2) + ("}" * ob)
         try:
-            result = json.loads(candidate)
-            print(f"[_extract_json] JSON riparato")
-            return result
+            return json.loads(candidate)
         except json.JSONDecodeError as e:
             raise ValueError(f"JSON troncato non riparabile: {e}")
-
     return json.loads(text[start:end])
 
 
@@ -133,16 +125,13 @@ def _extract_json(text: str) -> dict:
 def validate_and_fix_costs(analysis: dict, budget: int) -> dict:
     stanze = analysis.get("stanze", [])
     rc     = analysis.setdefault("riepilogo_costi", {})
-
     for room in stanze:
         for iv in room.get("interventi", []):
             if iv.get("costo_min", 0) > iv.get("costo_max", 0):
                 iv["costo_min"], iv["costo_max"] = iv["costo_max"], iv["costo_min"]
-
     totale_stanze     = sum(r.get("costo_totale_stanza", 0) for r in stanze)
     totale_dichiarato = rc.get("totale", 0)
     totale_reale      = max(totale_stanze, totale_dichiarato)
-
     if totale_reale > budget or abs(totale_stanze - totale_dichiarato) > 50:
         target = int(budget * 0.95)
         factor = target / max(totale_reale, 1)
@@ -158,12 +147,11 @@ def validate_and_fix_costs(analysis: dict, budget: int) -> dict:
         rc["budget_residuo"] = budget - rc["totale"]
         nota = rc.get("nota_budget", "")
         rc["nota_budget"] = (nota + ". " if nota else "") + \
-            f"Costi ricalibrati per rispettare il budget di €{budget}."
-
+            f"Costi ricalibrati per budget €{budget}."
     return analysis
 
 
-# ── Gemini 2.5 Flash ──────────────────────────────────────────────────────────
+# ── Gemini 2.5 Flash — REST API diretta ──────────────────────────────────────
 
 async def analyze_with_gemini(photos: list, prefs: dict) -> dict:
     key = _cache_key(photos, prefs)
@@ -206,18 +194,18 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
 una scheda professionale di home staging per {dest_label}.
 
 PARAMETRI:
-- Budget totale:   €{budget}
+- Budget totale:   \u20ac{budget}
 - Stile richiesto: {style}
-- Città:           {location}
+- Citt\u00e0:           {location}
 - Destinazione:    {dest_label}
 
 REGOLE PREZZI:
 - Usa prezzi reali di {location}.
 - Distribuzione consigliata:
-    Arredi e complementi:        €{alloc['arredi']} (~40%)
-    Tinteggiatura manodopera:    €{alloc['tinteggiatura']} (~30%)
-    Materiali pittura/accessori: €{alloc['materiali']} (~20%)
-    Montaggio e imprevisti:      €{alloc['montaggio']} (~10%)
+    Arredi e complementi:        \u20ac{alloc['arredi']} (~40%)
+    Tinteggiatura manodopera:    \u20ac{alloc['tinteggiatura']} (~30%)
+    Materiali pittura/accessori: \u20ac{alloc['materiali']} (~20%)
+    Montaggio e imprevisti:      \u20ac{alloc['montaggio']} (~10%)
 
 REGOLA MATEMATICA CRITICA:
 SOMMA(costo_totale_stanza) deve essere <= {budget}.
@@ -233,11 +221,11 @@ Restituisci SOLO questo JSON (costi come interi):
 {{
   "valutazione_generale": "analisi visiva dettagliata",
   "punti_di_forza": ["punto 1", "punto 2", "punto 3"],
-  "criticita": ["criticità 1", "criticità 2"],
-  "potenziale_str": "analisi potenziale per {dest_label} a {location}",
+  "criticita": ["critica 1", "critica 2"],
+  "potenziale_str": "potenziale per {dest_label} a {location}",
   "tariffe": {{
-    "attuale_notte": "€XX-YY",
-    "post_restyling_notte": "€XX-YY",
+    "attuale_notte": "\u20acXX-YY",
+    "post_restyling_notte": "\u20acXX-YY",
     "incremento_percentuale": "XX%"
   }},
   "stanze": [
@@ -248,15 +236,15 @@ Restituisci SOLO questo JSON (costi come interi):
       "interventi": [
         {{
           "titolo": "nome breve",
-          "dettaglio": "prodotti specifici, brand, prezzo, tariffa {location}",
+          "dettaglio": "prodotti, brand, prezzo, tariffa {location}",
           "costo_min": 50,
           "costo_max": 120,
           "priorita": "alta",
-          "dove_comprare": "negozio coerente con {style}"
+          "dove_comprare": "negozio per {style}"
         }}
       ],
       "costo_totale_stanza": 350,
-      "prompt_imagen": "Photorealistic interior photo, {style} style, same room geometry preserved: same walls same windows same ceiling same floor, [new furniture colors/materials matching {style}], [textiles matching {style}], [decorative objects typical of {style}], warm natural light, 35mm wide angle, magazine quality 4k"
+      "prompt_imagen": "Photorealistic interior photo, {style} style, same walls same windows same ceiling same floor, new furniture matching {style}, natural light, 35mm wide angle, magazine quality 4k"
     }}
   ],
   "riepilogo_costi": {{
@@ -266,45 +254,56 @@ Restituisci SOLO questo JSON (costi come interi):
     "montaggio_varie": 0,
     "totale": 0,
     "budget_residuo": 0,
-    "nota_budget": "commento allocazione budget €{budget}"
+    "nota_budget": "commento budget \u20ac{budget}"
   }},
   "piano_acquisti": [
     {{
       "categoria": "Tessili",
-      "items": ["item specifico per {style}"],
+      "items": ["item per {style}"],
       "budget_stimato": 0,
       "negozi_consigliati": "negozi per {style}"
     }}
   ],
   "titolo_annuncio_suggerito": "Titolo Airbnb max 50 caratteri",
   "highlights_str": ["highlight 1", "highlight 2", "highlight 3"],
-  "roi_restyling": "ROI: €X investimento, +€Y/notte, break-even Z notti"
+  "roi_restyling": "ROI: \u20acX investimento, +\u20acY/notte, break-even Z notti"
 }}"""
 
-    # Costruiamo i contents come dizionari raw — evita problemi di compatibilità
-    # tra versioni del SDK google-genai (from_bytes, from_text cambiano spesso)
-    contents = []
+    # Costruiamo il payload REST direttamente — zero dipendenze SDK
+    parts = []
     for p in photos:
-        contents.append({
+        parts.append({
             "inline_data": {
                 "mime_type": p["content_type"],
                 "data": base64.b64encode(p["content"]).decode()
             }
         })
-    contents.append({"text": prompt})
+    parts.append({"text": prompt})
 
-    response = _genai_client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            temperature=0.2,
-            max_output_tokens=16384,
-            response_mime_type="application/json",
-        ),
+    payload = {
+        "system_instruction": {
+            "parts": [{"text": system_instruction}]
+        },
+        "contents": [
+            {"role": "user", "parts": parts}
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 16384,
+            "responseMimeType": "application/json"
+        }
+    }
+
+    response = httpx.post(
+        GEMINI_URL,
+        json=payload,
+        timeout=120.0,
+        headers={"Content-Type": "application/json"}
     )
+    response.raise_for_status()
 
-    text = response.text.strip()
+    data = response.json()
+    text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -322,7 +321,6 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
     for room in stanze:
         idx    = room.get("indice_foto", 0)
         prompt = room.get("prompt_imagen", "")
-
         if idx < len(photos) and prompt:
             photo_bytes = photos[idx]["content"]
             fn = _controlnet_depth_sync if use_controlnet else _imagen_edit_sync
@@ -374,7 +372,6 @@ def _imagen_edit_sync(photo_bytes: bytes, prompt: str) -> str | None:
 def _controlnet_depth_sync(photo_bytes: bytes, prompt: str) -> str | None:
     try:
         import replicate
-        import httpx
         img_b64 = base64.b64encode(photo_bytes).decode()
         output  = replicate.run(
             "lucataco/sdxl-controlnet-depth:latest",
