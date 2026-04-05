@@ -1,7 +1,8 @@
 """
 HomeStager AI — FastAPI Backend
-Pipeline: Upload → Gemini 1.5 Pro analysis → Imagen 3 staging (parallel) → WeasyPrint PDF → SendGrid
+Pipeline: Upload → Gemini 2.5 Flash → Imagen 3 → WeasyPrint PDF → SendGrid
 """
+import traceback
 import uuid
 import asyncio
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
@@ -10,21 +11,19 @@ from ai_service import analyze_with_gemini, generate_staged_photos
 from pdf_service import generate_pdf
 from email_service import send_report_email
 
-
 app = FastAPI(title="HomeStager AI")
 
-# Update allow_origins with your Vercel URL after first deploy
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
+        "http://localhost:3000",
         "https://staged-ai-six.vercel.app",
     ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# In-memory job store. Works for single-instance Cloud Run (min-instances=1).
 jobs: dict = {}
 
 
@@ -48,7 +47,6 @@ async def analyze(
     if len(photos) > 10:
         raise HTTPException(status_code=400, detail="Massimo 10 foto")
 
-    # Read all bytes before handing off — UploadFile is not safe after response
     photo_data = []
     for photo in photos:
         content = await photo.read()
@@ -113,11 +111,13 @@ async def _process_job(job_id: str, photos: list, prefs: dict, email: str):
         }
 
     except Exception as exc:
-        import traceback
-        traceback.print_exc()
+        # Traceback completo salvato nel job — visibile nel frontend per debug
+        tb = traceback.format_exc()
+        print(tb)  # anche nei log Cloud Run
         jobs[job_id] = {
             "status": "error",
             "progress": 0,
             "step": "Errore",
-            "error": str(exc),
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": tb,  # ← NUOVO: traceback completo
         }
