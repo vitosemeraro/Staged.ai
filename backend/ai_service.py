@@ -1,7 +1,7 @@
 """
-AI Service v5
-- Gemini 2.5 Flash via REST API diretta (httpx) — bypassa SDK google-genai
-- Imagen 3 inpainting via vertexai SDK
+AI Service v5 — dynamic negative prompt, full-room Imagen prompt
+- Gemini 2.5 Flash via REST API diretta (httpx)
+- Imagen 3 inpainting con negative_prompt dinamico per stanza
 - validate_and_fix_costs(), compress_image(), _extract_json()
 """
 import asyncio
@@ -29,7 +29,6 @@ LOCATION        = os.environ.get("GCP_LOCATION", "us-central1")
 GEMINI_API_KEY  = os.environ["GEMINI_API_KEY"]
 REPLICATE_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "")
 
-# URL REST API Gemini — nessun SDK, nessun problema di versione
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
@@ -147,7 +146,7 @@ def validate_and_fix_costs(analysis: dict, budget: int) -> dict:
         rc["budget_residuo"] = budget - rc["totale"]
         nota = rc.get("nota_budget", "")
         rc["nota_budget"] = (nota + ". " if nota else "") + \
-            f"Costi ricalibrati per budget €{budget}."
+            f"Costi ricalibrati per budget \u20ac{budget}."
     return analysis
 
 
@@ -182,10 +181,10 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
     system_instruction = (
         "Sei un esperto consulente di home staging e interior design italiano, "
         "specializzato in affitti brevi e case vacanza. "
-        "Conosci i prezzi di mercato delle principali città italiane per manodopera, "
+        "Conosci i prezzi di mercato delle principali citt\u00e0 italiane per manodopera, "
         "materiali (Leroy Merlin, Brico) e arredi (IKEA, H&M Home, Zara Home, "
         "Maisons du Monde, mercatini, Amazon, Etsy). "
-        "I prezzi devono riflettere il mercato reale della città indicata. "
+        "I prezzi devono riflettere il mercato reale della citt\u00e0 indicata. "
         "Rispondi ESCLUSIVAMENTE con un oggetto JSON valido. "
         "Nessun testo prima o dopo. Nessun markdown. Nessun backtick."
     )
@@ -214,7 +213,19 @@ riepilogo_costi.budget_residuo = {budget} - totale.
 
 REGOLA STILE "{style}":
 Arredi, colori, tessili coerenti con "{style}".
-prompt_imagen: stanza DOPO restyling in inglese, geometria originale preservata.
+
+REGOLA prompt_imagen:
+- Descrive la stanza DOPO il restyling in inglese
+- Deve mostrare la STANZA INTERA in campo largo (wide angle view, shot from corner/doorway, entire room visible)
+- Mantieni la geometria originale: stesse pareti, stesse finestre, stesso soffitto, stesso pavimento
+- Cambia SOLO gli elementi inclusi negli interventi del budget
+
+REGOLA negative_prompt_imagen:
+- Elenca in inglese tutto cio\u00e0 che NON deve essere modificato da Imagen
+- Include SEMPRE: walls, ceiling, floor, windows, doors, room geometry, room layout
+- Include anche tutti gli elementi strutturali/fissi NON coperti dagli interventi
+  Es: se la cucina non ha interventi di sostituzione mobili -> aggiungi "kitchen cabinets, kitchen units, worktop"
+  Es: se il bagno non ha interventi di sostituzione sanitari -> aggiungi "bathtub, toilet, sink, tiles"
 
 Restituisci SOLO questo JSON (costi come interi):
 
@@ -244,7 +255,8 @@ Restituisci SOLO questo JSON (costi come interi):
         }}
       ],
       "costo_totale_stanza": 350,
-      "prompt_imagen": "Photorealistic interior photo, {style} style, same walls same windows same ceiling same floor, new furniture matching {style}, natural light, 35mm wide angle, magazine quality 4k"
+      "prompt_imagen": "Photorealistic interior photo, WIDE ANGLE full room view shot from doorway/corner showing entire room, {style} style, same walls same windows same ceiling same floor preserved, [ONLY elements covered by budget interventions are changed: new furniture/textiles/decor matching {style}], warm natural light, professional architectural photography, 24mm wide angle lens, magazine quality 4k",
+      "negative_prompt_imagen": "do not modify: walls, ceiling, floor, windows, window frames, doors, door frames, radiators, room geometry, room proportions, [list here all structural elements NOT covered by the interventions above, e.g. kitchen cabinets if not in budget]"
     }}
   ],
   "riepilogo_costi": {{
@@ -269,7 +281,6 @@ Restituisci SOLO questo JSON (costi come interi):
   "roi_restyling": "ROI: \u20acX investimento, +\u20acY/notte, break-even Z notti"
 }}"""
 
-    # Costruiamo il payload REST direttamente — zero dipendenze SDK
     parts = []
     for p in photos:
         parts.append({
@@ -281,12 +292,8 @@ Restituisci SOLO questo JSON (costi come interi):
     parts.append({"text": prompt})
 
     payload = {
-        "system_instruction": {
-            "parts": [{"text": system_instruction}]
-        },
-        "contents": [
-            {"role": "user", "parts": parts}
-        ],
+        "system_instruction": {"parts": [{"text": system_instruction}]},
+        "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {
             "temperature": 0.2,
             "maxOutputTokens": 16384,
@@ -310,7 +317,7 @@ Restituisci SOLO questo JSON (costi come interi):
         return _extract_json(text)
 
 
-# ── Imagen 3 — staged photos (parallelo) ─────────────────────────────────────
+# ── Imagen 3 — staged photos (parallelo, negative prompt dinamico) ─────────────
 
 async def generate_staged_photos(photos: list, analysis: dict) -> list:
     stanze         = analysis.get("stanze", [])
@@ -318,15 +325,40 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
     use_controlnet = bool(REPLICATE_TOKEN)
     tasks          = []
 
+    # Negative prompt base — sempre applicato indipendentemente dal budget
+    BASE_NEGATIVE = (
+        "do not modify: walls, ceiling, floor tiles, parquet flooring, "
+        "windows, window frames, doors, door frames, radiators, "
+        "room geometry, room proportions, room layout, furniture arrangement, "
+        "close-up view, cropped view"
+    )
+
     for room in stanze:
         idx    = room.get("indice_foto", 0)
         prompt = room.get("prompt_imagen", "")
+
+        # Negative prompt dinamico: base + quello specifico generato da Gemini
+        room_negative = room.get("negative_prompt_imagen", "")
+        full_negative = (
+            f"{BASE_NEGATIVE}, {room_negative}"
+            if room_negative
+            else BASE_NEGATIVE
+        )
+
         if idx < len(photos) and prompt:
             photo_bytes = photos[idx]["content"]
-            fn = _controlnet_depth_sync if use_controlnet else _imagen_edit_sync
-            tasks.append(loop.run_in_executor(_imagen_executor, fn, photo_bytes, prompt))
+            if use_controlnet:
+                tasks.append(loop.run_in_executor(
+                    _imagen_executor, _controlnet_depth_sync, photo_bytes, prompt, full_negative
+                ))
+            else:
+                tasks.append(loop.run_in_executor(
+                    _imagen_executor, _imagen_edit_sync, photo_bytes, prompt, full_negative
+                ))
         elif prompt:
-            tasks.append(loop.run_in_executor(_imagen_executor, _imagen_generate_sync, prompt))
+            tasks.append(loop.run_in_executor(
+                _imagen_executor, _imagen_generate_sync, prompt, full_negative
+            ))
         else:
             tasks.append(_noop())
 
@@ -341,7 +373,7 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
     return output
 
 
-def _imagen_edit_sync(photo_bytes: bytes, prompt: str) -> str | None:
+def _imagen_edit_sync(photo_bytes: bytes, prompt: str, negative_prompt: str) -> str | None:
     try:
         model        = ImageGenerationModel.from_pretrained("imagegeneration@006")
         source_image = VisionImage(image_bytes=photo_bytes)
@@ -354,11 +386,7 @@ def _imagen_edit_sync(photo_bytes: bytes, prompt: str) -> str | None:
                 "dining table, coffee table, curtains, blinds, rugs, floor lamps, "
                 "wall art, cushions, plants, decorative objects, bedding, towels"
             ),
-            negative_prompt=(
-                "do not modify: walls, ceiling, floor, windows, doors, radiators, "
-                "built-in wardrobes, kitchen cabinets, appliances, bathroom fixtures, "
-                "room geometry, room proportions"
-            ),
+            negative_prompt=negative_prompt,
             number_of_images=1,
             guidance_scale=60,
             seed=42,
@@ -366,10 +394,10 @@ def _imagen_edit_sync(photo_bytes: bytes, prompt: str) -> str | None:
         return base64.b64encode(response.images[0]._image_bytes).decode()
     except Exception as e:
         print(f"[Imagen edit] fallback: {e}")
-        return _imagen_generate_sync(prompt)
+        return _imagen_generate_sync(prompt, negative_prompt)
 
 
-def _controlnet_depth_sync(photo_bytes: bytes, prompt: str) -> str | None:
+def _controlnet_depth_sync(photo_bytes: bytes, prompt: str, negative_prompt: str) -> str | None:
     try:
         import replicate
         img_b64 = base64.b64encode(photo_bytes).decode()
@@ -378,7 +406,7 @@ def _controlnet_depth_sync(photo_bytes: bytes, prompt: str) -> str | None:
             input={
                 "image":                         f"data:image/jpeg;base64,{img_b64}",
                 "prompt":                        prompt,
-                "negative_prompt":               "deformed walls, distorted geometry, blurry",
+                "negative_prompt":               negative_prompt,
                 "controlnet_conditioning_scale": 0.85,
                 "num_inference_steps":           30,
                 "guidance_scale":                7.5,
@@ -389,10 +417,10 @@ def _controlnet_depth_sync(photo_bytes: bytes, prompt: str) -> str | None:
         return base64.b64encode(img_bytes).decode()
     except Exception as e:
         print(f"[ControlNet] fallback: {e}")
-        return _imagen_edit_sync(photo_bytes, prompt)
+        return _imagen_edit_sync(photo_bytes, prompt, negative_prompt)
 
 
-def _imagen_generate_sync(prompt: str) -> str | None:
+def _imagen_generate_sync(prompt: str, negative_prompt: str) -> str | None:
     try:
         model    = ImageGenerationModel.from_pretrained("imagen-3.0-generate-001")
         response = model.generate_images(prompt=prompt, number_of_images=1, aspect_ratio="4:3")
