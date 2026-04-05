@@ -313,14 +313,19 @@ Restituisci SOLO questo JSON (costi come interi):
         model="gemini-2.5-flash",
         contents=image_parts + [types.Part.from_text(text=prompt)],
         config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            temperature=0.2,
-            max_output_tokens=8192,  # aumentato: JSON con 5+ stanze supera 4096
-        ),
+        system_instruction=system_instruction,
+        temperature=0.2,
+        max_output_tokens=16384,
+        response_mime_type="application/json",
+      ),
     )
 
+    # Con response_mime_type="application/json" la risposta è JSON garantito
     text = response.text.strip()
-    return _extract_json(text)
+    try:
+        return json.loads(text)
+        except json.JSONDecodeError:
+        return _extract_json(text)  # fallback robusto
 
 
 # ── Imagen 3 — staged photos (parallelo) ─────────────────────────────────────
