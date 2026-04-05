@@ -215,13 +215,11 @@ REGOLA STILE "{style}":
 Arredi, colori, tessili coerenti con "{style}".
 
 REGOLA prompt_imagen (CRITICA — segui esattamente questo formato):
-Il prompt descrive SOLO gli oggetti nuovi da generare nelle aree mascherate.
-NON menzionare mai walls, windows, floor, ceiling nel prompt (il modello potrebbe ridisegnarli).
-Formato: "A high-end {style} interior design staging. Replace the masked areas with [mobili specifici
-in materiali e colori dello stile {style}]. Use a color palette of [colori stile]. Add cozy elements
-like [tessili e complementi stile]. The style must be [aggettivi stile]. Ensure the new furniture
-perfectly matches the original room's perspective, floor level, and wall lines.
-High-quality architectural photography, realistic lighting, 8k resolution."
+Scrivi un prompt BREVE (max 30 parole) che descrive SOLO i nuovi oggetti
+da inserire nelle aree mascherate, nello stile {style}.
+Formato: "A {style} interior staging. [3-5 nuovi elementi specifici con materiali e colori].
+Realistic lighting, 8k resolution."
+NON descrivere la stanza, NON menzionare walls/windows/floor/ceiling.
 
 REGOLA negative_prompt_imagen:
 - Include SEMPRE: blurry, low quality, watermark, text, distorted perspective
@@ -258,7 +256,7 @@ Restituisci SOLO questo JSON (costi come interi):
         }}
       ],
       "costo_totale_stanza": 350,
-      "prompt_imagen": "A high-end {style} interior design staging. Replace the masked areas with [specific furniture in materials and colors matching {style} — describe exactly]. Use a color palette of [colors typical of {style}]. Add cozy elements like [textiles and accessories matching {style}]. The style must be [adjectives matching {style}]. Ensure the new furniture perfectly matches the original room's perspective, floor level, and wall lines. High-quality architectural photography, realistic lighting, 8k resolution.",
+      "prompt_imagen": "A {style} interior staging. [3-5 specific new items with materials and colors matching {style}]. Realistic lighting, 8k resolution.",
       "negative_prompt_imagen": "blurry, low quality, watermark, text, distorted perspective, [list here ONLY the structural/fixed elements NOT covered by budget interventions, e.g.: kitchen cabinets, kitchen units, worktop, sink if kitchen furniture is not in budget]"
     }}
   ],
@@ -392,7 +390,7 @@ def _imagen_edit_sync(photo_bytes: bytes, prompt: str, negative_prompt: str) -> 
             ),
             negative_prompt=negative_prompt,
             number_of_images=1,
-            guidance_scale=65,
+            guidance_scale=35,
             seed=42,
         )
         return base64.b64encode(response.images[0]._image_bytes).decode()
