@@ -214,18 +214,21 @@ riepilogo_costi.budget_residuo = {budget} - totale.
 REGOLA STILE "{style}":
 Arredi, colori, tessili coerenti con "{style}".
 
-REGOLA prompt_imagen:
-- Descrive la stanza DOPO il restyling in inglese
-- Deve mostrare la STANZA INTERA in campo largo (wide angle view, shot from corner/doorway, entire room visible)
-- Mantieni la geometria originale: stesse pareti, stesse finestre, stesso soffitto, stesso pavimento
-- Cambia SOLO gli elementi inclusi negli interventi del budget
+REGOLA prompt_imagen (CRITICA — segui esattamente questo formato):
+Il prompt descrive SOLO gli oggetti nuovi da generare nelle aree mascherate.
+NON menzionare mai walls, windows, floor, ceiling nel prompt (il modello potrebbe ridisegnarli).
+Formato: "A high-end {style} interior design staging. Replace the masked areas with [mobili specifici
+in materiali e colori dello stile {style}]. Use a color palette of [colori stile]. Add cozy elements
+like [tessili e complementi stile]. The style must be [aggettivi stile]. Ensure the new furniture
+perfectly matches the original room's perspective, floor level, and wall lines.
+High-quality architectural photography, realistic lighting, 8k resolution."
 
 REGOLA negative_prompt_imagen:
-- Elenca in inglese tutto cio\u00e0 che NON deve essere modificato da Imagen
-- Include SEMPRE: walls, ceiling, floor, windows, doors, room geometry, room layout
-- Include anche tutti gli elementi strutturali/fissi NON coperti dagli interventi
-  Es: se la cucina non ha interventi di sostituzione mobili -> aggiungi "kitchen cabinets, kitchen units, worktop"
-  Es: se il bagno non ha interventi di sostituzione sanitari -> aggiungi "bathtub, toilet, sink, tiles"
+- Include SEMPRE: blurry, low quality, watermark, text, distorted perspective
+- Aggiungi gli elementi strutturali NON coperti dagli interventi:
+  Es: cucina senza interventi mobili -> "kitchen cabinets, kitchen units, worktop, sink"
+  Es: bagno senza interventi sanitari -> "bathtub, toilet, sink, tiles"
+- NON mettere mai walls/ceiling/floor/windows nel negative prompt (li protegge già la maschera)"
 
 Restituisci SOLO questo JSON (costi come interi):
 
@@ -255,8 +258,8 @@ Restituisci SOLO questo JSON (costi come interi):
         }}
       ],
       "costo_totale_stanza": 350,
-      "prompt_imagen": "Photorealistic interior photo, {style} style, EXACT SAME CAMERA ANGLE AND PERSPECTIVE as the original photo, EXACT SAME ROOM GEOMETRY: same walls same windows same ceiling same floor same viewpoint, only replace [elements covered by budget interventions] with {style} alternatives, warm natural light, magazine quality 4k",
-      "negative_prompt_imagen": "do not modify: walls, ceiling, floor, windows, window frames, doors, door frames, radiators, room geometry, room proportions, [list here all structural elements NOT covered by the interventions above, e.g. kitchen cabinets if not in budget]"
+      "prompt_imagen": "A high-end {style} interior design staging. Replace the masked areas with [specific furniture in materials and colors matching {style} — describe exactly]. Use a color palette of [colors typical of {style}]. Add cozy elements like [textiles and accessories matching {style}]. The style must be [adjectives matching {style}]. Ensure the new furniture perfectly matches the original room's perspective, floor level, and wall lines. High-quality architectural photography, realistic lighting, 8k resolution.",
+      "negative_prompt_imagen": "blurry, low quality, watermark, text, distorted perspective, [list here ONLY the structural/fixed elements NOT covered by budget interventions, e.g.: kitchen cabinets, kitchen units, worktop, sink if kitchen furniture is not in budget]"
     }}
   ],
   "riepilogo_costi": {{
@@ -382,13 +385,14 @@ def _imagen_edit_sync(photo_bytes: bytes, prompt: str, negative_prompt: str) -> 
             prompt=prompt,
             edit_mode="inpainting-insert",
             mask_prompt=(
-                "all movable furniture and soft furnishings: sofa, armchair, chairs, "
-                "dining table, coffee table, curtains, blinds, rugs, floor lamps, "
-                "wall art, cushions, plants, decorative objects, bedding, towels"
+                # Mask prompt consigliato da Gemini per massima fedeltà spaziale
+                "furniture, chairs, table, sofa, bed, curtains, cabinets, "
+                "refrigerator, oven, sink, lamps, rugs, decorative objects, "
+                "wall art, kitchen appliances, towels, mirror, radiator"
             ),
             negative_prompt=negative_prompt,
             number_of_images=1,
-            guidance_scale=60,
+            guidance_scale=65,
             seed=42,
         )
         return base64.b64encode(response.images[0]._image_bytes).decode()
