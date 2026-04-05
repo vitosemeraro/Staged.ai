@@ -1,9 +1,9 @@
 """
-AI Service v3
+AI Service v4
 - Gemini 2.5 Flash via API key (google-genai SDK)
+- Contents passati come dizionari raw — evita problemi di compatibilità SDK
 - Imagen 3 inpainting per le foto staged (via vertexai SDK)
-  NOTE: Imagen 3 deprecato il 24/06/2026 — migrare a Gemini Image quando stabile
-- validate_and_fix_costs(): validazione matematica budget post-Gemini
+- validate_and_fix_costs(): validazione matematica budget
 - compress_image(): compressione foto per PDF < 8MB
 """
 import asyncio
@@ -26,7 +26,7 @@ try:
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
-    print("[WARNING] Pillow non installato — compressione immagini disabilitata")
+    print("[WARNING] Pillow non installato")
 
 PROJECT_ID      = os.environ["GCP_PROJECT_ID"]
 LOCATION        = os.environ.get("GCP_LOCATION", "us-central1")
@@ -42,13 +42,13 @@ _imagen_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="imagen"
 _analysis_cache: dict[str, dict] = {}
 
 
-# ── Placeholder coroutine (sostituisce async def _none() dentro loop) ─────────
+# ── Coroutine placeholder (non definita dentro il loop) ───────────────────────
 
 async def _noop():
     return None
 
 
-# ── Utilità: compressione foto ────────────────────────────────────────────────
+# ── Compressione foto ─────────────────────────────────────────────────────────
 
 def compress_image(img_bytes: bytes, max_width: int = 1400, quality: int = 82) -> bytes:
     if not HAS_PIL:
@@ -62,7 +62,7 @@ def compress_image(img_bytes: bytes, max_width: int = 1400, quality: int = 82) -
         img.save(buf, format="JPEG", quality=quality, optimize=True)
         return buf.getvalue()
     except Exception as e:
-        print(f"[compress_image] fallback a originale: {e}")
+        print(f"[compress_image] fallback: {e}")
         return img_bytes
 
 
@@ -77,13 +77,8 @@ def _cache_key(photos: list, prefs: dict) -> str:
 
 
 def _extract_json(text: str) -> dict:
-    """
-    Estrae JSON robusto dalla risposta di Gemini.
-    Gestisce: backtick markdown, testo prima/dopo il JSON, JSON troncato.
-    """
     text = re.sub(r"^```(?:json)?\s*", "", text.strip())
-    text = re.sub(r"\s*```\s*$", "", text)
-    text = text.strip()
+    text = re.sub(r"\s*```\s*$", "", text).strip()
 
     try:
         return json.loads(text)
@@ -92,7 +87,7 @@ def _extract_json(text: str) -> dict:
 
     start = text.find("{")
     if start == -1:
-        raise ValueError(f"Nessun JSON trovato nella risposta Gemini: {text[:200]}")
+        raise ValueError(f"Nessun JSON nella risposta: {text[:300]}")
 
     depth = 0
     end = -1
@@ -120,23 +115,20 @@ def _extract_json(text: str) -> dict:
 
     if end == -1:
         candidate = text[start:]
-        open_braces   = candidate.count("{") - candidate.count("}")
-        open_brackets = candidate.count("[") - candidate.count("]")
-        repair = ("]" * open_brackets) + ("}" * open_braces)
-        candidate = candidate + repair
+        ob = candidate.count("{") - candidate.count("}")
+        ob2 = candidate.count("[") - candidate.count("]")
+        candidate += ("]" * ob2) + ("}" * ob)
         try:
             result = json.loads(candidate)
-            print(f"[_extract_json] JSON riparato ({open_braces} chiusure aggiunte)")
+            print(f"[_extract_json] JSON riparato")
             return result
         except json.JSONDecodeError as e:
-            raise ValueError(
-                f"JSON troncato e non riparabile. Errore: {e}"
-            )
+            raise ValueError(f"JSON troncato non riparabile: {e}")
 
     return json.loads(text[start:end])
 
 
-# ── Validazione costi post-Gemini ─────────────────────────────────────────────
+# ── Validazione costi ─────────────────────────────────────────────────────────
 
 def validate_and_fix_costs(analysis: dict, budget: int) -> dict:
     stanze = analysis.get("stanze", [])
@@ -144,10 +136,8 @@ def validate_and_fix_costs(analysis: dict, budget: int) -> dict:
 
     for room in stanze:
         for iv in room.get("interventi", []):
-            cmin = iv.get("costo_min", 0)
-            cmax = iv.get("costo_max", 0)
-            if cmin > cmax:
-                iv["costo_min"], iv["costo_max"] = cmax, cmin
+            if iv.get("costo_min", 0) > iv.get("costo_max", 0):
+                iv["costo_min"], iv["costo_max"] = iv["costo_max"], iv["costo_min"]
 
     totale_stanze     = sum(r.get("costo_totale_stanza", 0) for r in stanze)
     totale_dichiarato = rc.get("totale", 0)
@@ -156,22 +146,19 @@ def validate_and_fix_costs(analysis: dict, budget: int) -> dict:
     if totale_reale > budget or abs(totale_stanze - totale_dichiarato) > 50:
         target = int(budget * 0.95)
         factor = target / max(totale_reale, 1)
-
         for room in stanze:
             room["costo_totale_stanza"] = int(room["costo_totale_stanza"] * factor)
             for iv in room.get("interventi", []):
                 iv["costo_min"] = int(iv["costo_min"] * factor)
                 iv["costo_max"] = int(iv["costo_max"] * factor)
-
         for k in ["manodopera_tinteggiatura", "materiali_pittura",
                   "arredi_complementi", "montaggio_varie"]:
             rc[k] = int(rc.get(k, 0) * factor)
-
         rc["totale"]         = sum(r["costo_totale_stanza"] for r in stanze)
         rc["budget_residuo"] = budget - rc["totale"]
         nota = rc.get("nota_budget", "")
         rc["nota_budget"] = (nota + ". " if nota else "") + \
-            f"Costi ricalibrati automaticamente per rispettare il budget di €{budget}."
+            f"Costi ricalibrati per rispettare il budget di €{budget}."
 
     return analysis
 
@@ -183,7 +170,6 @@ async def analyze_with_gemini(photos: list, prefs: dict) -> dict:
     if key in _analysis_cache:
         print("[Gemini] cache hit")
         return _analysis_cache[key]
-
     loop   = asyncio.get_running_loop()
     result = await loop.run_in_executor(_gemini_executor, _gemini_sync, photos, prefs)
     result = validate_and_fix_costs(result, prefs["budget"])
@@ -208,21 +194,15 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
     system_instruction = (
         "Sei un esperto consulente di home staging e interior design italiano, "
         "specializzato in affitti brevi e case vacanza. "
-        "Conosci in dettaglio i prezzi di mercato delle principali città italiane "
-        "per manodopera edile, materiali (Leroy Merlin, Brico) e arredi "
-        "(IKEA, H&M Home, Zara Home, Maisons du Monde, mercatini, Amazon, Etsy). "
+        "Conosci i prezzi di mercato delle principali città italiane per manodopera, "
+        "materiali (Leroy Merlin, Brico) e arredi (IKEA, H&M Home, Zara Home, "
+        "Maisons du Monde, mercatini, Amazon, Etsy). "
         "I prezzi devono riflettere il mercato reale della città indicata. "
         "Rispondi ESCLUSIVAMENTE con un oggetto JSON valido. "
         "Nessun testo prima o dopo. Nessun markdown. Nessun backtick."
     )
 
-    # FIX: usa types.Part(text=...) invece di types.Part.from_text(text=...)
-    # Il nuovo SDK google-genai non ha from_text come metodo statico
-    contents = [
-        types.Part.from_bytes(data=p["content"], mime_type=p["content_type"])
-        for p in photos
-    ]
-    contents.append(types.Part(text=f"""Analizza queste {len(photos)} foto di un appartamento e produci
+    prompt = f"""Analizza queste {len(photos)} foto di un appartamento e produci
 una scheda professionale di home staging per {dest_label}.
 
 PARAMETRI:
@@ -245,14 +225,13 @@ riepilogo_costi.totale = quella somma.
 riepilogo_costi.budget_residuo = {budget} - totale.
 
 REGOLA STILE "{style}":
-Tutti gli arredi, colori, tessili devono essere coerenti con lo stile "{style}".
-prompt_imagen: descrivi in inglese la stanza DOPO restyling con elementi
-specifici e riconoscibili dello stile "{style}", mantenendo geometria originale.
+Arredi, colori, tessili coerenti con "{style}".
+prompt_imagen: stanza DOPO restyling in inglese, geometria originale preservata.
 
 Restituisci SOLO questo JSON (costi come interi):
 
 {{
-  "valutazione_generale": "analisi visiva dettagliata delle criticità attuali",
+  "valutazione_generale": "analisi visiva dettagliata",
   "punti_di_forza": ["punto 1", "punto 2", "punto 3"],
   "criticita": ["criticità 1", "criticità 2"],
   "potenziale_str": "analisi potenziale per {dest_label} a {location}",
@@ -265,19 +244,19 @@ Restituisci SOLO questo JSON (costi come interi):
     {{
       "nome": "Soggiorno",
       "indice_foto": 0,
-      "stato_attuale": "descrizione stato attuale specifica",
+      "stato_attuale": "descrizione stato attuale",
       "interventi": [
         {{
-          "titolo": "nome intervento breve",
-          "dettaglio": "prodotti specifici, brand, prezzo unitario, tariffa {location}",
+          "titolo": "nome breve",
+          "dettaglio": "prodotti specifici, brand, prezzo, tariffa {location}",
           "costo_min": 50,
           "costo_max": 120,
           "priorita": "alta",
-          "dove_comprare": "negozio coerente con stile {style}"
+          "dove_comprare": "negozio coerente con {style}"
         }}
       ],
       "costo_totale_stanza": 350,
-      "prompt_imagen": "Photorealistic interior photo after home staging, {style} style, same room geometry preserved: same walls same windows same ceiling same floor, [specific new furniture colors/materials matching {style}], [specific textiles matching {style}], [specific decorative objects typical of {style}], warm natural light, professional architectural photography, 35mm wide angle lens, shot from corner, magazine quality 4k"
+      "prompt_imagen": "Photorealistic interior photo, {style} style, same room geometry preserved: same walls same windows same ceiling same floor, [new furniture colors/materials matching {style}], [textiles matching {style}], [decorative objects typical of {style}], warm natural light, 35mm wide angle, magazine quality 4k"
     }}
   ],
   "riepilogo_costi": {{
@@ -287,20 +266,32 @@ Restituisci SOLO questo JSON (costi come interi):
     "montaggio_varie": 0,
     "totale": 0,
     "budget_residuo": 0,
-    "nota_budget": "commento su priorità e rispetto budget €{budget}"
+    "nota_budget": "commento allocazione budget €{budget}"
   }},
   "piano_acquisti": [
     {{
       "categoria": "Tessili",
-      "items": ["item specifico coerente con {style}"],
+      "items": ["item specifico per {style}"],
       "budget_stimato": 0,
-      "negozi_consigliati": "negozi coerenti con {style}"
+      "negozi_consigliati": "negozi per {style}"
     }}
   ],
-  "titolo_annuncio_suggerito": "Titolo Airbnb max 50 caratteri per {location}",
+  "titolo_annuncio_suggerito": "Titolo Airbnb max 50 caratteri",
   "highlights_str": ["highlight 1", "highlight 2", "highlight 3"],
-  "roi_restyling": "ROI: investimento €X, +€Y/notte, break-even Z notti (~N mesi al 60% occupazione)"
-}}"""))
+  "roi_restyling": "ROI: €X investimento, +€Y/notte, break-even Z notti"
+}}"""
+
+    # Costruiamo i contents come dizionari raw — evita problemi di compatibilità
+    # tra versioni del SDK google-genai (from_bytes, from_text cambiano spesso)
+    contents = []
+    for p in photos:
+        contents.append({
+            "inline_data": {
+                "mime_type": p["content_type"],
+                "data": base64.b64encode(p["content"]).decode()
+            }
+        })
+    contents.append({"text": prompt})
 
     response = _genai_client.models.generate_content(
         model="gemini-2.5-flash",
@@ -321,7 +312,6 @@ Restituisci SOLO questo JSON (costi come interi):
 
 
 # ── Imagen 3 — staged photos (parallelo) ─────────────────────────────────────
-# NOTA: Imagen 3 sarà deprecato il 24/06/2026.
 
 async def generate_staged_photos(photos: list, analysis: dict) -> list:
     stanze         = analysis.get("stanze", [])
@@ -340,7 +330,6 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
         elif prompt:
             tasks.append(loop.run_in_executor(_imagen_executor, _imagen_generate_sync, prompt))
         else:
-            # FIX: _noop() definita fuori dal loop, non dentro
             tasks.append(_noop())
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -354,8 +343,6 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
     return output
 
 
-# ── Path A — Imagen 3 inpainting ─────────────────────────────────────────────
-
 def _imagen_edit_sync(photo_bytes: bytes, prompt: str) -> str | None:
     try:
         model        = ImageGenerationModel.from_pretrained("imagegeneration@006")
@@ -366,29 +353,23 @@ def _imagen_edit_sync(photo_bytes: bytes, prompt: str) -> str | None:
             edit_mode="inpainting-insert",
             mask_prompt=(
                 "all movable furniture and soft furnishings: sofa, armchair, chairs, "
-                "dining table, coffee table, side tables, curtains, blinds, rugs, carpets, "
-                "floor lamps, table lamps, ceiling pendants, cushions, throws, pillows, "
-                "wall art, paintings, posters, mirrors, decorative objects, vases, plants, "
-                "books, shelves contents, bedding, duvet, bed linen, towels, bathroom accessories"
+                "dining table, coffee table, curtains, blinds, rugs, floor lamps, "
+                "wall art, cushions, plants, decorative objects, bedding, towels"
             ),
             negative_prompt=(
-                "do not modify: walls, ceiling, floor tiles, parquet flooring, "
-                "windows, window frames, doors, door frames, radiators, "
-                "built-in wardrobes structure, kitchen cabinets structure, "
-                "kitchen appliances, bathroom fixtures, bathtub, shower, toilet, sink, "
-                "structural columns, room geometry, room proportions"
+                "do not modify: walls, ceiling, floor, windows, doors, radiators, "
+                "built-in wardrobes, kitchen cabinets, appliances, bathroom fixtures, "
+                "room geometry, room proportions"
             ),
             number_of_images=1,
             guidance_scale=60,
             seed=42,
         )
         return base64.b64encode(response.images[0]._image_bytes).decode()
-    except Exception as edit_err:
-        print(f"[Imagen edit] fallback a generazione pura: {edit_err}")
+    except Exception as e:
+        print(f"[Imagen edit] fallback: {e}")
         return _imagen_generate_sync(prompt)
 
-
-# ── Path B — ControlNet Depth via Replicate (premium) ────────────────────────
 
 def _controlnet_depth_sync(photo_bytes: bytes, prompt: str) -> str | None:
     try:
@@ -400,7 +381,7 @@ def _controlnet_depth_sync(photo_bytes: bytes, prompt: str) -> str | None:
             input={
                 "image":                         f"data:image/jpeg;base64,{img_b64}",
                 "prompt":                        prompt,
-                "negative_prompt":               "deformed walls, distorted geometry, wrong perspective, blurry, low quality",
+                "negative_prompt":               "deformed walls, distorted geometry, blurry",
                 "controlnet_conditioning_scale": 0.85,
                 "num_inference_steps":           30,
                 "guidance_scale":                7.5,
@@ -409,22 +390,16 @@ def _controlnet_depth_sync(photo_bytes: bytes, prompt: str) -> str | None:
         url       = output[0] if isinstance(output, list) else output
         img_bytes = httpx.get(str(url), timeout=60).content
         return base64.b64encode(img_bytes).decode()
-    except Exception as ctrl_err:
-        print(f"[ControlNet] fallback a Imagen edit: {ctrl_err}")
+    except Exception as e:
+        print(f"[ControlNet] fallback: {e}")
         return _imagen_edit_sync(photo_bytes, prompt)
 
-
-# ── Path C — Imagen 3 text-to-image (fallback) ───────────────────────────────
 
 def _imagen_generate_sync(prompt: str) -> str | None:
     try:
         model    = ImageGenerationModel.from_pretrained("imagen-3.0-generate-001")
-        response = model.generate_images(
-            prompt=prompt,
-            number_of_images=1,
-            aspect_ratio="4:3",
-        )
+        response = model.generate_images(prompt=prompt, number_of_images=1, aspect_ratio="4:3")
         return base64.b64encode(response.images[0]._image_bytes).decode()
-    except Exception as gen_err:
-        print(f"[Imagen generate] fallito: {gen_err}")
+    except Exception as e:
+        print(f"[Imagen generate] fallito: {e}")
         return None
