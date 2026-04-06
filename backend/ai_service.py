@@ -53,7 +53,7 @@ MASK_PROMPT = (
 # NON menziona walls/windows/floor (li protegge la maschera)
 # guidance_scale=35 garantisce fedeltà alla foto originale
 def _build_imagen_prompt(style: str, oggetti: str) -> str:
-    return f"A {style} interior staging. {oggetti}. Realistic lighting, 8k resolution."
+    return f"Professional home staging, {style} style, {oggetti}. High resolution, realistic photography."
 
 
 async def _noop():
@@ -341,8 +341,8 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
     tasks          = []
 
     BASE_NEGATIVE = (
-        "do not modify: walls, ceiling, floor, windows, doors, "
-        "room geometry, room proportions, room layout"
+        "structural changes, moving walls, changing windows, changing floor tiles, "
+        "modifying ceiling, different room layout, distorted architecture, blurry, low quality"
     )
 
     for room in stanze:
@@ -383,16 +383,17 @@ def _imagen_edit_sync(photo_bytes: bytes, prompt: str, negative_prompt: str) -> 
             base_image=source_image,
             prompt=prompt,
             edit_mode="inpainting-insert",
-            mask_prompt=MASK_PROMPT,
+            mask_prompt="furniture, decor, rugs, clutter",  # chirurgico — non tocca struttura
             negative_prompt=negative_prompt,
             number_of_images=1,
-            guidance_scale=35,  # basso = massima fedeltà alla foto originale
+            guidance_scale=12,  # 10-12 raccomandato da Gemini — fedeltà senza allucinazioni
             seed=42,
         )
         return base64.b64encode(response.images[0]._image_bytes).decode()
     except Exception as e:
-        print(f"[Imagen edit] fallback: {e}")
-        return _imagen_generate_sync(prompt, negative_prompt)
+        # NO fallback a generate_images — meglio None che una stanza inventata
+        print(f"[Imagen edit] errore: {e}")
+        return None
 
 
 def _controlnet_depth_sync(photo_bytes: bytes, prompt: str, negative_prompt: str) -> str | None:
