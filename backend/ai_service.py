@@ -376,7 +376,6 @@ def _imagen_edit_sync(photo_bytes: bytes, prompt: str, negative_prompt: str) -> 
             base_image=source_image,
             prompt=prompt,
             edit_mode="inpainting-insert",
-            mask_prompt=MASK_PROMPT,
             negative_prompt=negative_prompt,
             number_of_images=1,
             guidance_scale=12,
