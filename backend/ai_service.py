@@ -370,7 +370,7 @@ def _imagen_edit_sync(photo_bytes: bytes, prompt: str, negative_prompt: str) -> 
         compressed = compress_image(photo_bytes, max_width=1200, quality=85)
         print(f"[Imagen edit] foto: {len(photo_bytes)//1024}KB -> {len(compressed)//1024}KB")
 
-        model        = ImageGenerationModel.from_pretrained("imagegeneration@006")
+        model        = ImageGenerationModel.from_pretrained("imagegeneration@002")
         source_image = VisionImage(image_bytes=compressed)
         response = model.edit_image(
             base_image=source_image,
