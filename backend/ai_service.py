@@ -350,11 +350,8 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
             tasks.append(loop.run_in_executor(
                 _imagen_executor, fn, photo_bytes, prompt, full_negative
             ))
-        elif prompt:
-            tasks.append(loop.run_in_executor(
-                _imagen_executor, _imagen_edit_sync, photo_bytes, prompt, full_negative
-            ))
         else:
+            # Nessuna foto corrispondente — non tentare edit, restituisce None
             tasks.append(_noop())
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
