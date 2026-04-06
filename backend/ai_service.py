@@ -1,8 +1,9 @@
 """
-AI Service v5 — dynamic negative prompt, full-room Imagen prompt
-- Gemini 2.5 Flash via REST API diretta (httpx)
-- Imagen 3 inpainting con negative_prompt dinamico per stanza
-- validate_and_fix_costs(), compress_image(), _extract_json()
+AI Service v6 — prompt_imagen generato in Python, non da Gemini
+- Gemini fornisce solo "oggetti_da_sostituire" (3-5 parole)
+- Il prompt Imagen è un template fisso nel codice — corto e ancorato alla foto
+- guidance_scale=35 per massima fedeltà all'originale
+- negative_prompt dinamico per stanza
 """
 import asyncio
 import base64
@@ -40,6 +41,19 @@ _gemini_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="gemini"
 _imagen_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="imagen")
 
 _analysis_cache: dict[str, dict] = {}
+
+# Mask prompt fisso — raccomandato da Gemini per massima fedeltà spaziale
+MASK_PROMPT = (
+    "furniture, chairs, table, sofa, bed, curtains, cabinets, "
+    "refrigerator, oven, sink, lamps, rugs, decorative objects, "
+    "wall art, kitchen appliances, towels, mirror, radiator"
+)
+
+# Template prompt Imagen — CORTO e fisso, solo gli oggetti variano
+# NON menziona walls/windows/floor (li protegge la maschera)
+# guidance_scale=35 garantisce fedeltà alla foto originale
+def _build_imagen_prompt(style: str, oggetti: str) -> str:
+    return f"A {style} interior staging. {oggetti}. Realistic lighting, 8k resolution."
 
 
 async def _noop():
@@ -150,7 +164,7 @@ def validate_and_fix_costs(analysis: dict, budget: int) -> dict:
     return analysis
 
 
-# ── Gemini 2.5 Flash — REST API diretta ──────────────────────────────────────
+# ── Gemini 2.5 Flash ──────────────────────────────────────────────────────────
 
 async def analyze_with_gemini(photos: list, prefs: dict) -> dict:
     key = _cache_key(photos, prefs)
@@ -211,22 +225,17 @@ SOMMA(costo_totale_stanza) deve essere <= {budget}.
 riepilogo_costi.totale = quella somma.
 riepilogo_costi.budget_residuo = {budget} - totale.
 
-REGOLA STILE "{style}":
-Arredi, colori, tessili coerenti con "{style}".
-
-REGOLA prompt_imagen (CRITICA — segui esattamente questo formato):
-Scrivi un prompt BREVE (max 30 parole) che descrive SOLO i nuovi oggetti
-da inserire nelle aree mascherate, nello stile {style}.
-Formato: "A {style} interior staging. [3-5 nuovi elementi specifici con materiali e colori].
-Realistic lighting, 8k resolution."
-NON descrivere la stanza, NON menzionare walls/windows/floor/ceiling.
+REGOLA oggetti_da_sostituire (IMPORTANTE):
+Elenca in inglese SOLO i 3-5 nuovi oggetti specifici da inserire nella stanza
+in stile {style}, con materiale e colore. Max 20 parole. Solo oggetti, no descrizioni.
+Esempio: "light oak dining table, linen white curtains, wool grey rug, pendant lamp"
 
 REGOLA negative_prompt_imagen:
-- Include SEMPRE: blurry, low quality, watermark, text, distorted perspective
-- Aggiungi gli elementi strutturali NON coperti dagli interventi:
-  Es: cucina senza interventi mobili -> "kitchen cabinets, kitchen units, worktop, sink"
-  Es: bagno senza interventi sanitari -> "bathtub, toilet, sink, tiles"
-- NON mettere mai walls/ceiling/floor/windows nel negative prompt (li protegge già la maschera)"
+Elenca in inglese gli elementi fissi/strutturali NON coperti dagli interventi.
+Includi SEMPRE: blurry, low quality, watermark, text, distorted perspective.
+Aggiungi elementi non toccati dal budget, es:
+- cucina senza interventi mobili: "kitchen cabinets, kitchen units, worktop"
+- bagno senza interventi sanitari: "bathtub, toilet, sink, bathroom tiles"
 
 Restituisci SOLO questo JSON (costi come interi):
 
@@ -256,8 +265,8 @@ Restituisci SOLO questo JSON (costi come interi):
         }}
       ],
       "costo_totale_stanza": 350,
-      "prompt_imagen": "A {style} interior staging. [3-5 specific new items with materials and colors matching {style}]. Realistic lighting, 8k resolution.",
-      "negative_prompt_imagen": "blurry, low quality, watermark, text, distorted perspective, [list here ONLY the structural/fixed elements NOT covered by budget interventions, e.g.: kitchen cabinets, kitchen units, worktop, sink if kitchen furniture is not in budget]"
+      "oggetti_da_sostituire": "light oak sofa, linen curtains white, wool rug grey, pendant lamp white",
+      "negative_prompt_imagen": "blurry, low quality, watermark, text, distorted perspective, kitchen cabinets, kitchen units"
     }}
   ],
   "riepilogo_costi": {{
@@ -312,13 +321,18 @@ Restituisci SOLO questo JSON (costi come interi):
 
     data = response.json()
     text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return _extract_json(text)
+    result = json.loads(text) if text.startswith("{") else _extract_json(text)
+
+    # Costruisci prompt_imagen da template fisso + oggetti_da_sostituire di Gemini
+    style = prefs["style"]
+    for room in result.get("stanze", []):
+        oggetti = room.get("oggetti_da_sostituire", "minimalist furniture and decor")
+        room["prompt_imagen"] = _build_imagen_prompt(style, oggetti)
+
+    return result
 
 
-# ── Imagen 3 — staged photos (parallelo, negative prompt dinamico) ─────────────
+# ── Imagen 3 — staged photos (parallelo) ──────────────────────────────────────
 
 async def generate_staged_photos(photos: list, analysis: dict) -> list:
     stanze         = analysis.get("stanze", [])
@@ -326,36 +340,23 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
     use_controlnet = bool(REPLICATE_TOKEN)
     tasks          = []
 
-    # Negative prompt base — sempre applicato indipendentemente dal budget
     BASE_NEGATIVE = (
-        "do not modify: walls, ceiling, floor tiles, parquet flooring, "
-        "windows, window frames, doors, door frames, radiators, "
-        "room geometry, room proportions, room layout, furniture arrangement, "
-        "close-up view, cropped view"
+        "do not modify: walls, ceiling, floor, windows, doors, "
+        "room geometry, room proportions, room layout"
     )
 
     for room in stanze:
         idx    = room.get("indice_foto", 0)
         prompt = room.get("prompt_imagen", "")
-
-        # Negative prompt dinamico: base + quello specifico generato da Gemini
         room_negative = room.get("negative_prompt_imagen", "")
-        full_negative = (
-            f"{BASE_NEGATIVE}, {room_negative}"
-            if room_negative
-            else BASE_NEGATIVE
-        )
+        full_negative = f"{BASE_NEGATIVE}, {room_negative}" if room_negative else BASE_NEGATIVE
 
         if idx < len(photos) and prompt:
             photo_bytes = photos[idx]["content"]
-            if use_controlnet:
-                tasks.append(loop.run_in_executor(
-                    _imagen_executor, _controlnet_depth_sync, photo_bytes, prompt, full_negative
-                ))
-            else:
-                tasks.append(loop.run_in_executor(
-                    _imagen_executor, _imagen_edit_sync, photo_bytes, prompt, full_negative
-                ))
+            fn = _controlnet_depth_sync if use_controlnet else _imagen_edit_sync
+            tasks.append(loop.run_in_executor(
+                _imagen_executor, fn, photo_bytes, prompt, full_negative
+            ))
         elif prompt:
             tasks.append(loop.run_in_executor(
                 _imagen_executor, _imagen_generate_sync, prompt, full_negative
@@ -382,15 +383,10 @@ def _imagen_edit_sync(photo_bytes: bytes, prompt: str, negative_prompt: str) -> 
             base_image=source_image,
             prompt=prompt,
             edit_mode="inpainting-insert",
-            mask_prompt=(
-                # Mask prompt consigliato da Gemini per massima fedeltà spaziale
-                "furniture, chairs, table, sofa, bed, curtains, cabinets, "
-                "refrigerator, oven, sink, lamps, rugs, decorative objects, "
-                "wall art, kitchen appliances, towels, mirror, radiator"
-            ),
+            mask_prompt=MASK_PROMPT,
             negative_prompt=negative_prompt,
             number_of_images=1,
-            guidance_scale=35,
+            guidance_scale=35,  # basso = massima fedeltà alla foto originale
             seed=42,
         )
         return base64.b64encode(response.images[0]._image_bytes).decode()
