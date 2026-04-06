@@ -377,22 +377,32 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
 
 def _imagen_edit_sync(photo_bytes: bytes, prompt: str, negative_prompt: str) -> str | None:
     try:
+        # Comprimi la foto prima di inviarla — Imagen rifiuta immagini > 10MB
+        # e spesso fallisce anche con foto > 2MB
+        compressed = compress_image(photo_bytes, max_width=1024, quality=85)
+        print(f"[Imagen edit] foto: {len(photo_bytes)//1024}KB -> {len(compressed)//1024}KB compressione")
+
         model        = ImageGenerationModel.from_pretrained("imagegeneration@006")
-        source_image = VisionImage(image_bytes=photo_bytes)
+        source_image = VisionImage(image_bytes=compressed)
         response = model.edit_image(
             base_image=source_image,
             prompt=prompt,
             edit_mode="inpainting-insert",
-            mask_prompt="furniture, decor, rugs, clutter",  # chirurgico — non tocca struttura
+            mask_prompt="furniture, chairs, sofa, tables, decor",
             negative_prompt=negative_prompt,
             number_of_images=1,
-            guidance_scale=12,  # 10-12 raccomandato da Gemini — fedeltà senza allucinazioni
+            guidance_scale=12,
             seed=42,
         )
-        return base64.b64encode(response.images[0]._image_bytes).decode()
+
+        if response and response.images:
+            return base64.b64encode(response.images[0]._image_bytes).decode()
+        print("[Imagen edit] risposta vuota — nessuna immagine generata")
+        return None
+
     except Exception as e:
-        # NO fallback a generate_images — meglio None che una stanza inventata
-        print(f"[Imagen edit] errore: {e}")
+        # Log dettagliato — visibile in Cloud Run Logs
+        print(f"[Imagen edit] ERRORE: {type(e).__name__}: {e}")
         return None
 
 
