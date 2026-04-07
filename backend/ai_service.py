@@ -22,10 +22,21 @@ except ImportError:
     HAS_PIL = False
     print("[WARNING] Pillow non installato")
 
-PROJECT_ID      = os.environ["GCP_PROJECT_ID"]
+# Leggi variabili d'ambiente con log esplicito se mancanti
+PROJECT_ID      = os.environ.get("GCP_PROJECT_ID", "")
 LOCATION        = os.environ.get("GCP_LOCATION", "us-central1")
-GEMINI_API_KEY  = os.environ["GEMINI_API_KEY"]
+GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
 REPLICATE_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "")
+
+# Log di startup per debug
+print(f"[startup] PROJECT_ID={PROJECT_ID!r}")
+print(f"[startup] LOCATION={LOCATION!r}")
+print(f"[startup] GEMINI_API_KEY={'SET' if GEMINI_API_KEY else 'MISSING'}")
+
+if not PROJECT_ID:
+    print("[startup] WARNING: GCP_PROJECT_ID non impostato")
+if not GEMINI_API_KEY:
+    print("[startup] WARNING: GEMINI_API_KEY non impostato")
 
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -345,14 +356,11 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
 
 
 def _gemini_image_edit_sync(photo_bytes: bytes, prompt: str) -> str | None:
-    """
-    Usa gemini-2.5-flash con responseModalities IMAGE+TEXT per generare
-    la foto staged a partire dalla foto originale.
-    Sostituto ufficiale di Imagen per l'editing.
-    """
     try:
         compressed = compress_image(photo_bytes, max_width=1200, quality=85)
-        print(f"[GeminiImage] foto: {len(photo_bytes)//1024}KB -> {len(compressed)//1024}KB")
+        print(f"[GeminiImage] START foto: {len(photo_bytes)//1024}KB -> {len(compressed)//1024}KB")
+        print(f"[GeminiImage] prompt: {prompt[:100]}")
+        print(f"[GeminiImage] URL: {GEMINI_IMAGE_URL[:80]}")
 
         img_b64 = base64.b64encode(compressed).decode()
 
@@ -384,27 +392,48 @@ def _gemini_image_edit_sync(photo_bytes: bytes, prompt: str) -> str | None:
             }
         }
 
+        print(f"[GeminiImage] invio richiesta HTTP...")
         response = httpx.post(
             GEMINI_IMAGE_URL,
             json=payload,
             timeout=120.0,
             headers={"Content-Type": "application/json"}
         )
-        response.raise_for_status()
+        print(f"[GeminiImage] HTTP status: {response.status_code}")
 
-        data = response.json()
-        candidates = data.get("candidates", [])
-        if not candidates:
-            print("[GeminiImage] nessun candidato nella risposta")
+        if response.status_code != 200:
+            print(f"[GeminiImage] ERRORE HTTP {response.status_code}: {response.text[:500]}")
             return None
 
-        for part in candidates[0].get("content", {}).get("parts", []):
-            if "inlineData" in part:
-                return part["inlineData"]["data"]
+        data = response.json()
+        print(f"[GeminiImage] risposta keys: {list(data.keys())}")
 
-        print("[GeminiImage] nessuna immagine nei parts della risposta")
+        candidates = data.get("candidates", [])
+        print(f"[GeminiImage] candidati: {len(candidates)}")
+
+        if not candidates:
+            print(f"[GeminiImage] nessun candidato. promptFeedback: {data.get('promptFeedback', 'N/A')}")
+            return None
+
+        parts = candidates[0].get("content", {}).get("parts", [])
+        print(f"[GeminiImage] parts nel candidato: {len(parts)}")
+
+        for i, part in enumerate(parts):
+            part_keys = list(part.keys())
+            print(f"[GeminiImage] part[{i}] keys: {part_keys}")
+            if "inlineData" in part:
+                mime = part["inlineData"].get("mimeType", "unknown")
+                data_len = len(part["inlineData"].get("data", ""))
+                print(f"[GeminiImage] SUCCESS immagine trovata mime={mime} data_len={data_len}")
+                return part["inlineData"]["data"]
+            elif "text" in part:
+                print(f"[GeminiImage] part testo: {part['text'][:200]}")
+
+        print(f"[GeminiImage] nessuna immagine nei {len(parts)} parts")
         return None
 
     except Exception as e:
+        import traceback
         print(f"[GeminiImage] ERRORE: {type(e).__name__}: {e}")
+        print(traceback.format_exc())
         return None
