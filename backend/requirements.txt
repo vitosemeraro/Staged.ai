@@ -2,12 +2,10 @@ google-genai==1.10.0
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 python-multipart==0.0.9
-google-cloud-aiplatform==1.93.0
 sendgrid==6.11.0
 weasyprint==62.3
 pydyf==0.11.0
 jinja2==3.1.4
 python-dotenv==1.0.1
 Pillow==10.4.0
-replicate==0.31.0
 httpx==0.28.1
