@@ -5,6 +5,7 @@ steps:
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
+      - '--no-cache'
       - '-t'
       - 'gcr.io/$PROJECT_ID/homestager-backend:$COMMIT_SHA'
       - './backend'
