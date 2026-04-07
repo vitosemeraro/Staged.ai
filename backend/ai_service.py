@@ -1,9 +1,8 @@
 """
-AI Service v6.1
-- Gemini 2.5 Flash via REST API diretta
-- Imagen 3 inpainting con guidance_scale=12
-- compress_image prima di inviare a Imagen
-- Nessun fallback a generate_images
+AI Service v7
+- Gemini 2.5 Flash via REST API per analisi
+- gemini-2.5-flash-image via REST API per staging foto (Imagen deprecato)
+- Nessun vertexai SDK per le immagini
 """
 import asyncio
 import base64
@@ -15,8 +14,6 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
-import vertexai
-from vertexai.preview.vision_models import ImageGenerationModel, Image as VisionImage
 
 try:
     from PIL import Image as PILImage
@@ -35,21 +32,24 @@ GEMINI_URL = (
     f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
 )
 
-vertexai.init(project=PROJECT_ID, location=LOCATION)
+# gemini-2.5-flash-image: sostituto ufficiale di tutti i modelli Imagen
+GEMINI_IMAGE_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"gemini-2.0-flash-exp-image-generation:generateContent?key={GEMINI_API_KEY}"
+)
 
 _gemini_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="gemini")
-_imagen_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="imagen")
+_imagen_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="imagen")
 
 _analysis_cache: dict[str, dict] = {}
-
-MASK_PROMPT = "furniture, chairs, sofa, tables, decor, rugs, curtains, clutter, messy objects"
 
 
 def _build_imagen_prompt(style: str, oggetti: str) -> str:
     return (
         f"Professional interior design photography, {style} style home staging. "
-        f"Featuring {oggetti}. Realistic cinematic lighting, high-end furniture, "
-        f"extremely detailed, 8k resolution."
+        f"Featuring {oggetti}. Keep the exact same room geometry, walls, floor, "
+        f"windows and ceiling. Only replace the furniture and decor. "
+        f"Realistic cinematic lighting, 8k resolution."
     )
 
 
@@ -161,7 +161,7 @@ def validate_and_fix_costs(analysis: dict, budget: int) -> dict:
     return analysis
 
 
-# ── Gemini 2.5 Flash ──────────────────────────────────────────────────────────
+# ── Gemini 2.5 Flash — analisi ────────────────────────────────────────────────
 
 async def analyze_with_gemini(photos: list, prefs: dict) -> dict:
     key = _cache_key(photos, prefs)
@@ -223,13 +223,9 @@ riepilogo_costi.totale = quella somma.
 riepilogo_costi.budget_residuo = {budget} - totale.
 
 REGOLA oggetti_da_sostituire:
-Elenca in inglese 3-5 nuovi oggetti specifici con materiale e colore per lo stile {style}.
+Elenca in inglese 3-5 nuovi oggetti specifici con materiale e colore per stile {style}.
 Max 20 parole. Solo oggetti, no descrizioni della stanza.
 Esempio: "light oak dining table, linen white curtains, wool grey rug, pendant lamp"
-
-REGOLA negative_prompt_imagen:
-Elementi fissi NON coperti dagli interventi da proteggere.
-Includi sempre: blurry, low quality, watermark, text, distorted perspective.
 
 Restituisci SOLO questo JSON (costi come interi):
 
@@ -259,8 +255,7 @@ Restituisci SOLO questo JSON (costi come interi):
         }}
       ],
       "costo_totale_stanza": 350,
-      "oggetti_da_sostituire": "light oak sofa, linen curtains white, wool rug grey, pendant lamp",
-      "negative_prompt_imagen": "blurry, low quality, watermark, text, distorted perspective"
+      "oggetti_da_sostituire": "light oak sofa, linen curtains white, wool rug grey, pendant lamp"
     }}
   ],
   "riepilogo_costi": {{
@@ -305,19 +300,14 @@ Restituisci SOLO questo JSON (costi come interi):
         }
     }
 
-    response = httpx.post(
-        GEMINI_URL,
-        json=payload,
-        timeout=120.0,
-        headers={"Content-Type": "application/json"}
-    )
+    response = httpx.post(GEMINI_URL, json=payload, timeout=120.0,
+                          headers={"Content-Type": "application/json"})
     response.raise_for_status()
 
     data = response.json()
     text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
     result = json.loads(text) if text.startswith("{") else _extract_json(text)
 
-    # Costruisci prompt_imagen da template fisso
     for room in result.get("stanze", []):
         oggetti = room.get("oggetti_da_sostituire", "minimalist furniture and decor")
         room["prompt_imagen"] = _build_imagen_prompt(style, oggetti)
@@ -325,101 +315,96 @@ Restituisci SOLO questo JSON (costi come interi):
     return result
 
 
-# ── Imagen 3 ──────────────────────────────────────────────────────────────────
+# ── gemini-2.5-flash-image — staged photos ───────────────────────────────────
 
 async def generate_staged_photos(photos: list, analysis: dict) -> list:
-    stanze         = analysis.get("stanze", [])
-    loop           = asyncio.get_running_loop()
-    use_controlnet = bool(REPLICATE_TOKEN)
-    tasks          = []
-
-    BASE_NEGATIVE = (
-        "structural changes, moving walls, changing windows, changing floor tiles, "
-        "modifying ceiling, different room layout, distorted architecture, blurry, low quality"
-    )
+    stanze = analysis.get("stanze", [])
+    loop   = asyncio.get_running_loop()
+    tasks  = []
 
     for room in stanze:
         idx    = room.get("indice_foto", 0)
         prompt = room.get("prompt_imagen", "")
-        room_negative = room.get("negative_prompt_imagen", "")
-        full_negative = f"{BASE_NEGATIVE}, {room_negative}" if room_negative else BASE_NEGATIVE
-
         if idx < len(photos) and prompt:
             photo_bytes = photos[idx]["content"]
-            fn = _controlnet_depth_sync if use_controlnet else _imagen_edit_sync
             tasks.append(loop.run_in_executor(
-                _imagen_executor, fn, photo_bytes, prompt, full_negative
+                _imagen_executor, _gemini_image_edit_sync, photo_bytes, prompt
             ))
         else:
-            # Nessuna foto corrispondente — non tentare edit, restituisce None
             tasks.append(_noop())
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     output  = []
     for r in results:
         if isinstance(r, Exception):
-            print(f"[Imagen] task fallito: {r}")
+            print(f"[GeminiImage] task fallito: {r}")
             output.append(None)
         else:
             output.append(r)
     return output
 
 
-def _imagen_edit_sync(photo_bytes: bytes, prompt: str, negative_prompt: str) -> str | None:
+def _gemini_image_edit_sync(photo_bytes: bytes, prompt: str) -> str | None:
+    """
+    Usa gemini-2.5-flash con responseModalities IMAGE+TEXT per generare
+    la foto staged a partire dalla foto originale.
+    Sostituto ufficiale di Imagen per l'editing.
+    """
     try:
         compressed = compress_image(photo_bytes, max_width=1200, quality=85)
-        print(f"[Imagen edit] foto: {len(photo_bytes)//1024}KB -> {len(compressed)//1024}KB")
+        print(f"[GeminiImage] foto: {len(photo_bytes)//1024}KB -> {len(compressed)//1024}KB")
 
-        model        = ImageGenerationModel.from_pretrained("imagegeneration@002")
-        source_image = VisionImage(image_bytes=compressed)
-        response = model.edit_image(
-            base_image=source_image,
-            prompt=prompt,
-            edit_mode="inpainting-insert",
-            negative_prompt=negative_prompt,
-            number_of_images=1,
-            guidance_scale=12,
-            seed=42,
+        img_b64 = base64.b64encode(compressed).decode()
+
+        payload = {
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": img_b64
+                        }
+                    },
+                    {
+                        "text": (
+                            f"Image-to-Image transformation. {prompt}\n\n"
+                            "CRITICAL: Do not move structural elements like windows, doors, "
+                            "and load-bearing walls. Maintain the exact room geometry, "
+                            "perspective, camera angle, walls, floor, ceiling and door positions. "
+                            "Only replace the furniture, curtains, rugs, and decorative objects. "
+                            "Output a photorealistic interior design image."
+                        )
+                    }
+                ]
+            }],
+            "generationConfig": {
+                "responseModalities": ["IMAGE"],
+                "temperature": 1.0,
+            }
+        }
+
+        response = httpx.post(
+            GEMINI_IMAGE_URL,
+            json=payload,
+            timeout=120.0,
+            headers={"Content-Type": "application/json"}
         )
+        response.raise_for_status()
 
-        if response and response.images:
-            return base64.b64encode(response.images[0]._image_bytes).decode()
-        print("[Imagen edit] risposta vuota — filtro sicurezza attivo")
+        data = response.json()
+        candidates = data.get("candidates", [])
+        if not candidates:
+            print("[GeminiImage] nessun candidato nella risposta")
+            return None
+
+        for part in candidates[0].get("content", {}).get("parts", []):
+            if "inlineData" in part:
+                return part["inlineData"]["data"]
+
+        print("[GeminiImage] nessuna immagine nei parts della risposta")
         return None
 
     except Exception as e:
-        print(f"[Imagen edit] ERRORE: {type(e).__name__}: {e}")
-        return None
-
-
-def _controlnet_depth_sync(photo_bytes: bytes, prompt: str, negative_prompt: str) -> str | None:
-    try:
-        import replicate
-        img_b64 = base64.b64encode(photo_bytes).decode()
-        output  = replicate.run(
-            "lucataco/sdxl-controlnet-depth:latest",
-            input={
-                "image":                         f"data:image/jpeg;base64,{img_b64}",
-                "prompt":                        prompt,
-                "negative_prompt":               negative_prompt,
-                "controlnet_conditioning_scale": 0.9,
-                "num_inference_steps":           30,
-                "guidance_scale":                8.0,
-            },
-        )
-        url       = output[0] if isinstance(output, list) else output
-        img_bytes = httpx.get(str(url), timeout=60).content
-        return base64.b64encode(img_bytes).decode()
-    except Exception as e:
-        print(f"[ControlNet] ERRORE: {type(e).__name__}: {e}")
-        return None
-
-
-def _imagen_generate_sync(prompt: str, negative_prompt: str) -> str | None:
-    try:
-        model    = ImageGenerationModel.from_pretrained("imagen-3.0-generate-001")
-        response = model.generate_images(prompt=prompt, number_of_images=1, aspect_ratio="4:3")
-        return base64.b64encode(response.images[0]._image_bytes).decode()
-    except Exception as e:
-        print(f"[Imagen generate] ERRORE: {type(e).__name__}: {e}")
+        print(f"[GeminiImage] ERRORE: {type(e).__name__}: {e}")
         return None
