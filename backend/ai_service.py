@@ -1,8 +1,8 @@
 """
-AI Service v7
+AI Service v8
 - Gemini 2.5 Flash via REST API per analisi
-- gemini-2.5-flash-image via REST API per staging foto (Imagen deprecato)
-- Nessun vertexai SDK per le immagini
+- gemini-2.0-flash-exp via google-genai SDK per staging foto
+- Nessun vertexai SDK
 """
 import asyncio
 import base64
@@ -14,6 +14,8 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
+from google import genai
+from google.genai import types as genai_types
 
 try:
     from PIL import Image as PILImage
@@ -22,32 +24,27 @@ except ImportError:
     HAS_PIL = False
     print("[WARNING] Pillow non installato")
 
-# Leggi variabili d'ambiente con log esplicito se mancanti
 PROJECT_ID      = os.environ.get("GCP_PROJECT_ID", "")
 LOCATION        = os.environ.get("GCP_LOCATION", "us-central1")
 GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
 REPLICATE_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "")
 
-# Log di startup per debug
 print(f"[startup] PROJECT_ID={PROJECT_ID!r}")
-print(f"[startup] LOCATION={LOCATION!r}")
 print(f"[startup] GEMINI_API_KEY={'SET' if GEMINI_API_KEY else 'MISSING'}")
-
-if not PROJECT_ID:
-    print("[startup] WARNING: GCP_PROJECT_ID non impostato")
-if not GEMINI_API_KEY:
-    print("[startup] WARNING: GEMINI_API_KEY non impostato")
 
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
 )
 
-# gemini-2.5-flash-image: sostituto ufficiale di tutti i modelli Imagen
-GEMINI_IMAGE_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-)
+# google-genai SDK client per image generation
+_genai_client = None
+
+def _get_genai_client():
+    global _genai_client
+    if _genai_client is None:
+        _genai_client = genai.Client(api_key=GEMINI_API_KEY)
+    return _genai_client
 
 _gemini_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="gemini")
 _imagen_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="imagen")
@@ -67,8 +64,6 @@ def _build_imagen_prompt(style: str, oggetti: str) -> str:
 async def _noop():
     return None
 
-
-# ── Compressione foto ─────────────────────────────────────────────────────────
 
 def compress_image(img_bytes: bytes, max_width: int = 1200, quality: int = 85) -> bytes:
     if not HAS_PIL:
@@ -105,43 +100,26 @@ def _extract_json(text: str) -> dict:
         pass
     start = text.find("{")
     if start == -1:
-        raise ValueError(f"Nessun JSON nella risposta: {text[:300]}")
-    depth = 0
-    end = -1
-    in_string = False
-    escape = False
+        raise ValueError(f"Nessun JSON: {text[:300]}")
+    depth = 0; end = -1; in_string = False; escape = False
     for i, ch in enumerate(text[start:], start=start):
-        if escape:
-            escape = False
-            continue
-        if ch == "\\" and in_string:
-            escape = True
-            continue
-        if ch == '"' and not escape:
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == "{":
-            depth += 1
+        if escape: escape = False; continue
+        if ch == "\\" and in_string: escape = True; continue
+        if ch == '"' and not escape: in_string = not in_string; continue
+        if in_string: continue
+        if ch == "{": depth += 1
         elif ch == "}":
             depth -= 1
-            if depth == 0:
-                end = i + 1
-                break
+            if depth == 0: end = i + 1; break
     if end == -1:
         candidate = text[start:]
-        ob  = candidate.count("{") - candidate.count("}")
+        ob = candidate.count("{") - candidate.count("}")
         ob2 = candidate.count("[") - candidate.count("]")
         candidate += ("]" * ob2) + ("}" * ob)
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"JSON troncato non riparabile: {e}")
+        try: return json.loads(candidate)
+        except json.JSONDecodeError as e: raise ValueError(f"JSON troncato: {e}")
     return json.loads(text[start:end])
 
-
-# ── Validazione costi ─────────────────────────────────────────────────────────
 
 def validate_and_fix_costs(analysis: dict, budget: int) -> dict:
     stanze = analysis.get("stanze", [])
@@ -171,8 +149,6 @@ def validate_and_fix_costs(analysis: dict, budget: int) -> dict:
             f"Costi ricalibrati per budget \u20ac{budget}."
     return analysis
 
-
-# ── Gemini 2.5 Flash — analisi ────────────────────────────────────────────────
 
 async def analyze_with_gemini(photos: list, prefs: dict) -> dict:
     key = _cache_key(photos, prefs)
@@ -211,85 +187,81 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "Nessun testo prima o dopo. Nessun markdown. Nessun backtick."
     )
 
-    prompt = f"""Analizza queste {len(photos)} foto di un appartamento e produci
-una scheda professionale di home staging per {dest_label}.
-
-PARAMETRI:
-- Budget totale:   \u20ac{budget}
-- Stile richiesto: {style}
-- Citt\u00e0:           {location}
-- Destinazione:    {dest_label}
-
-REGOLE PREZZI:
-- Usa prezzi reali di {location}.
-- Distribuzione consigliata:
-    Arredi e complementi:        \u20ac{alloc['arredi']} (~40%)
-    Tinteggiatura manodopera:    \u20ac{alloc['tinteggiatura']} (~30%)
-    Materiali pittura/accessori: \u20ac{alloc['materiali']} (~20%)
-    Montaggio e imprevisti:      \u20ac{alloc['montaggio']} (~10%)
-
-REGOLA MATEMATICA CRITICA:
-SOMMA(costo_totale_stanza) deve essere <= {budget}.
-riepilogo_costi.totale = quella somma.
-riepilogo_costi.budget_residuo = {budget} - totale.
-
-REGOLA oggetti_da_sostituire:
-Elenca in inglese 3-5 nuovi oggetti specifici con materiale e colore per stile {style}.
-Max 20 parole. Solo oggetti, no descrizioni della stanza.
-Esempio: "light oak dining table, linen white curtains, wool grey rug, pendant lamp"
-
-Restituisci SOLO questo JSON (costi come interi):
-
-{{
-  "valutazione_generale": "analisi visiva dettagliata",
-  "punti_di_forza": ["punto 1", "punto 2", "punto 3"],
-  "criticita": ["critica 1", "critica 2"],
-  "potenziale_str": "potenziale per {dest_label} a {location}",
-  "tariffe": {{
-    "attuale_notte": "\u20acXX-YY",
-    "post_restyling_notte": "\u20acXX-YY",
-    "incremento_percentuale": "XX%"
-  }},
-  "stanze": [
-    {{
-      "nome": "Soggiorno",
-      "indice_foto": 0,
-      "stato_attuale": "descrizione stato attuale",
-      "interventi": [
-        {{
-          "titolo": "nome breve",
-          "dettaglio": "prodotti, brand, prezzo, tariffa {location}",
-          "costo_min": 50,
-          "costo_max": 120,
-          "priorita": "alta",
-          "dove_comprare": "negozio per {style}"
-        }}
-      ],
-      "costo_totale_stanza": 350,
-      "oggetti_da_sostituire": "light oak sofa, linen curtains white, wool rug grey, pendant lamp"
-    }}
-  ],
-  "riepilogo_costi": {{
-    "manodopera_tinteggiatura": 0,
-    "materiali_pittura": 0,
-    "arredi_complementi": 0,
-    "montaggio_varie": 0,
-    "totale": 0,
-    "budget_residuo": 0,
-    "nota_budget": "commento budget \u20ac{budget}"
-  }},
-  "piano_acquisti": [
-    {{
-      "categoria": "Tessili",
-      "articoli": ["item per {style}"],
-      "budget_stimato": 0,
-      "negozi_consigliati": "negozi per {style}"
-    }}
-  ],
-  "titolo_annuncio_suggerito": "Titolo Airbnb max 50 caratteri",
-  "highlights_str": ["highlight 1", "highlight 2", "highlight 3"],
-  "roi_restyling": "ROI: \u20acX investimento, +\u20acY/notte, break-even Z notti"
-}}"""
+    prompt = (
+        f"Analizza queste {len(photos)} foto di un appartamento e produci\n"
+        f"una scheda professionale di home staging per {dest_label}.\n\n"
+        f"PARAMETRI:\n"
+        f"- Budget totale:   \u20ac{budget}\n"
+        f"- Stile richiesto: {style}\n"
+        f"- Citt\u00e0:           {location}\n"
+        f"- Destinazione:    {dest_label}\n\n"
+        f"REGOLE PREZZI:\n"
+        f"- Usa prezzi reali di {location}.\n"
+        f"- Distribuzione consigliata:\n"
+        f"    Arredi e complementi:        \u20ac{alloc['arredi']} (~40%)\n"
+        f"    Tinteggiatura manodopera:    \u20ac{alloc['tinteggiatura']} (~30%)\n"
+        f"    Materiali pittura/accessori: \u20ac{alloc['materiali']} (~20%)\n"
+        f"    Montaggio e imprevisti:      \u20ac{alloc['montaggio']} (~10%)\n\n"
+        f"REGOLA MATEMATICA CRITICA:\n"
+        f"SOMMA(costo_totale_stanza) deve essere <= {budget}.\n"
+        f"riepilogo_costi.totale = quella somma.\n"
+        f"riepilogo_costi.budget_residuo = {budget} - totale.\n\n"
+        f"REGOLA oggetti_da_sostituire:\n"
+        f"Elenca in inglese 3-5 nuovi oggetti specifici con materiale e colore per stile {style}.\n"
+        f"Max 20 parole. Solo oggetti, no descrizioni della stanza.\n"
+        f"Esempio: \"light oak dining table, linen white curtains, wool grey rug, pendant lamp\"\n\n"
+        f"Restituisci SOLO questo JSON (costi come interi):\n\n"
+        "{{\n"
+        "  \"valutazione_generale\": \"analisi visiva dettagliata\",\n"
+        "  \"punti_di_forza\": [\"punto 1\", \"punto 2\", \"punto 3\"],\n"
+        "  \"criticita\": [\"critica 1\", \"critica 2\"],\n"
+        f"  \"potenziale_str\": \"potenziale per {dest_label} a {location}\",\n"
+        "  \"tariffe\": {{\n"
+        "    \"attuale_notte\": \"\u20acXX-YY\",\n"
+        "    \"post_restyling_notte\": \"\u20acXX-YY\",\n"
+        "    \"incremento_percentuale\": \"XX%\"\n"
+        "  }},\n"
+        "  \"stanze\": [\n"
+        "    {{\n"
+        "      \"nome\": \"Soggiorno\",\n"
+        "      \"indice_foto\": 0,\n"
+        "      \"stato_attuale\": \"descrizione stato attuale\",\n"
+        "      \"interventi\": [\n"
+        "        {{\n"
+        "          \"titolo\": \"nome breve\",\n"
+        f"          \"dettaglio\": \"prodotti, brand, prezzo, tariffa {location}\",\n"
+        "          \"costo_min\": 50,\n"
+        "          \"costo_max\": 120,\n"
+        "          \"priorita\": \"alta\",\n"
+        f"          \"dove_comprare\": \"negozio per {style}\"\n"
+        "        }}\n"
+        "      ],\n"
+        "      \"costo_totale_stanza\": 350,\n"
+        "      \"oggetti_da_sostituire\": \"light oak sofa, linen curtains white, wool rug grey, pendant lamp\"\n"
+        "    }}\n"
+        "  ],\n"
+        "  \"riepilogo_costi\": {{\n"
+        "    \"manodopera_tinteggiatura\": 0,\n"
+        "    \"materiali_pittura\": 0,\n"
+        "    \"arredi_complementi\": 0,\n"
+        "    \"montaggio_varie\": 0,\n"
+        "    \"totale\": 0,\n"
+        "    \"budget_residuo\": 0,\n"
+        f"    \"nota_budget\": \"commento budget \u20ac{budget}\"\n"
+        "  }},\n"
+        "  \"piano_acquisti\": [\n"
+        "    {{\n"
+        "      \"categoria\": \"Tessili\",\n"
+        f"      \"articoli\": [\"item per {style}\"],\n"
+        "      \"budget_stimato\": 0,\n"
+        f"      \"negozi_consigliati\": \"negozi per {style}\"\n"
+        "    }}\n"
+        "  ],\n"
+        "  \"titolo_annuncio_suggerito\": \"Titolo Airbnb max 50 caratteri\",\n"
+        "  \"highlights_str\": [\"highlight 1\", \"highlight 2\", \"highlight 3\"],\n"
+        "  \"roi_restyling\": \"ROI: \u20acX investimento, +\u20acY/notte, break-even Z notti\"\n"
+        "}}"
+    )
 
     parts = []
     for p in photos:
@@ -326,8 +298,6 @@ Restituisci SOLO questo JSON (costi come interi):
     return result
 
 
-# ── gemini-2.5-flash-image — staged photos ───────────────────────────────────
-
 async def generate_staged_photos(photos: list, analysis: dict) -> list:
     stanze = analysis.get("stanze", [])
     loop   = asyncio.get_running_loop()
@@ -358,78 +328,39 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
 def _gemini_image_edit_sync(photo_bytes: bytes, prompt: str) -> str | None:
     try:
         compressed = compress_image(photo_bytes, max_width=1200, quality=85)
-        print(f"[GeminiImage] START foto: {len(photo_bytes)//1024}KB -> {len(compressed)//1024}KB")
-        print(f"[GeminiImage] prompt: {prompt[:100]}")
-        print(f"[GeminiImage] URL: {GEMINI_IMAGE_URL[:80]}")
+        print(f"[GeminiImage] START {len(photo_bytes)//1024}KB -> {len(compressed)//1024}KB")
 
-        img_b64 = base64.b64encode(compressed).decode()
+        client = _get_genai_client()
 
-        payload = {
-            "contents": [{
-                "role": "user",
-                "parts": [
-                    {
-                        "inline_data": {
-                            "mime_type": "image/jpeg",
-                            "data": img_b64
-                        }
-                    },
-                    {
-                        "text": (
-                            f"Image-to-Image transformation. {prompt}\n\n"
-                            "CRITICAL: Do not move structural elements like windows, doors, "
-                            "and load-bearing walls. Maintain the exact room geometry, "
-                            "perspective, camera angle, walls, floor, ceiling and door positions. "
-                            "Only replace the furniture, curtains, rugs, and decorative objects. "
-                            "Output a photorealistic interior design image."
-                        )
-                    }
-                ]
-            }],
-            "generationConfig": {
-                "responseModalities": ["IMAGE", "TEXT"],
-                "temperature": 1.0,
-            }
-        }
-
-        print(f"[GeminiImage] invio richiesta HTTP...")
-        response = httpx.post(
-            GEMINI_IMAGE_URL,
-            json=payload,
-            timeout=120.0,
-            headers={"Content-Type": "application/json"}
+        full_prompt = (
+            "Image-to-Image transformation. " + prompt + "\n\n"
+            "CRITICAL: Do not move structural elements like windows, doors, "
+            "and load-bearing walls. Maintain the exact room geometry, "
+            "perspective, camera angle, walls, floor, ceiling and door positions. "
+            "Only replace the furniture, curtains, rugs, and decorative objects."
         )
-        print(f"[GeminiImage] HTTP status: {response.status_code}")
 
-        if response.status_code != 200:
-            print(f"[GeminiImage] ERRORE HTTP {response.status_code}: {response.text[:500]}")
-            return None
+        response = client.models.generate_content(
+            model="gemini-2.0-flash-exp",
+            contents=[
+                genai_types.Part.from_bytes(data=compressed, mime_type="image/jpeg"),
+                genai_types.Part.from_text(text=full_prompt),
+            ],
+            config=genai_types.GenerateContentConfig(
+                response_modalities=["Text", "Image"],
+                temperature=1.0,
+            ),
+        )
 
-        data = response.json()
-        print(f"[GeminiImage] risposta keys: {list(data.keys())}")
+        print(f"[GeminiImage] risposta ricevuta")
+        for part in response.candidates[0].content.parts:
+            if part.inline_data is not None:
+                print(f"[GeminiImage] SUCCESS mime={part.inline_data.mime_type}")
+                return base64.b64encode(part.inline_data.data).decode()
+            elif part.text:
+                print(f"[GeminiImage] testo: {part.text[:100]}")
 
-        candidates = data.get("candidates", [])
-        print(f"[GeminiImage] candidati: {len(candidates)}")
-
-        if not candidates:
-            print(f"[GeminiImage] nessun candidato. promptFeedback: {data.get('promptFeedback', 'N/A')}")
-            return None
-
-        parts = candidates[0].get("content", {}).get("parts", [])
-        print(f"[GeminiImage] parts nel candidato: {len(parts)}")
-
-        for i, part in enumerate(parts):
-            part_keys = list(part.keys())
-            print(f"[GeminiImage] part[{i}] keys: {part_keys}")
-            if "inlineData" in part:
-                mime = part["inlineData"].get("mimeType", "unknown")
-                data_len = len(part["inlineData"].get("data", ""))
-                print(f"[GeminiImage] SUCCESS immagine trovata mime={mime} data_len={data_len}")
-                return part["inlineData"]["data"]
-            elif "text" in part:
-                print(f"[GeminiImage] part testo: {part['text'][:200]}")
-
-        print(f"[GeminiImage] nessuna immagine nei {len(parts)} parts")
+        print("[GeminiImage] nessuna immagine nei parts")
         return None
 
     except Exception as e:
