@@ -85,16 +85,15 @@ async def _process_job(job_id: str, photos: list, prefs: dict, email: str):
         update(10, "Gemini analizza le foto…")
         analysis = await analyze_with_gemini(photos, prefs)
 
-        update(35, "Imagen 3 genera le foto staged…")
-        staged_photos = await generate_staged_photos(photos, analysis)
+        update(35, "Imagen 3 genera le foto staged (4 approcci)…")
+        staged_results = await generate_staged_photos(photos, analysis)
 
         update(70, "Compilazione scheda…")
-        for i, room in enumerate(analysis.get("stanze", [])):
-            if i < len(staged_photos):
-                room["staged_photo_b64"] = staged_photos[i]
+        # staged_results è ora una lista di dict con chiavi A_base, B_geometric, C_reference, D_edit
+        # Non serve più attaccare staged_photo_b64 alle stanze — lo fa generate_pdf
 
         update(80, "Generazione PDF…")
-        pdf_bytes = generate_pdf(analysis, prefs, photos)
+        pdf_bytes = generate_pdf(analysis, prefs, photos, staged_results=staged_results)
 
         update(92, "Invio email…")
         send_report_email(email, pdf_bytes, analysis, prefs)
