@@ -1,8 +1,8 @@
 """
-AI Service v8
-- Gemini 2.5 Flash via REST API per analisi
-- gemini-2.0-flash-exp via google-genai SDK per staging foto
-- Nessun vertexai SDK
+AI Service v9
+- Gemini 2.5 Flash via REST API per analisi JSON
+- imagen-3.0-generate-002 via google-genai SDK per staged photos
+  (generate_images con prompt dettagliato dalla descrizione Gemini)
 """
 import asyncio
 import base64
@@ -24,10 +24,9 @@ except ImportError:
     HAS_PIL = False
     print("[WARNING] Pillow non installato")
 
-PROJECT_ID      = os.environ.get("GCP_PROJECT_ID", "")
-LOCATION        = os.environ.get("GCP_LOCATION", "us-central1")
-GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
-REPLICATE_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "")
+PROJECT_ID     = os.environ.get("GCP_PROJECT_ID", "")
+LOCATION       = os.environ.get("GCP_LOCATION", "us-central1")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 print(f"[startup] PROJECT_ID={PROJECT_ID!r}")
 print(f"[startup] GEMINI_API_KEY={'SET' if GEMINI_API_KEY else 'MISSING'}")
@@ -37,7 +36,6 @@ GEMINI_URL = (
     f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
 )
 
-# google-genai SDK client per image generation
 _genai_client = None
 
 def _get_genai_client():
@@ -50,15 +48,6 @@ _gemini_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="gemini"
 _imagen_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="imagen")
 
 _analysis_cache: dict[str, dict] = {}
-
-
-def _build_imagen_prompt(style: str, oggetti: str) -> str:
-    return (
-        f"Professional interior design photography, {style} style home staging. "
-        f"Featuring {oggetti}. Keep the exact same room geometry, walls, floor, "
-        f"windows and ceiling. Only replace the furniture and decor. "
-        f"Realistic cinematic lighting, 8k resolution."
-    )
 
 
 async def _noop():
@@ -206,10 +195,14 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         f"SOMMA(costo_totale_stanza) deve essere <= {budget}.\n"
         f"riepilogo_costi.totale = quella somma.\n"
         f"riepilogo_costi.budget_residuo = {budget} - totale.\n\n"
-        f"REGOLA oggetti_da_sostituire:\n"
-        f"Elenca in inglese 3-5 nuovi oggetti specifici con materiale e colore per stile {style}.\n"
-        f"Max 20 parole. Solo oggetti, no descrizioni della stanza.\n"
-        f"Esempio: \"light oak dining table, linen white curtains, wool grey rug, pendant lamp\"\n\n"
+        f"REGOLA prompt_imagen:\n"
+        f"Scrivi un prompt fotografico professionale in inglese per Imagen 3.\n"
+        f"Deve descrivere la stanza DOPO il restyling in stile {style}.\n"
+        f"Includi: tipo stanza, stile {style}, colori, materiali specifici degli arredi,\n"
+        f"illuminazione, atmosfera. Max 60 parole. NON menzionare pareti o finestre.\n"
+        f"Esempio: \"Photorealistic interior photo, Scandinavian living room after staging,\n"
+        f"light oak furniture, white linen sofa, grey wool rug, pendant lamp,\n"
+        f"green plants, warm natural light, minimalist decor, 4k quality\"\n\n"
         f"Restituisci SOLO questo JSON (costi come interi):\n\n"
         "{{\n"
         "  \"valutazione_generale\": \"analisi visiva dettagliata\",\n"
@@ -237,7 +230,7 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "        }}\n"
         "      ],\n"
         "      \"costo_totale_stanza\": 350,\n"
-        "      \"oggetti_da_sostituire\": \"light oak sofa, linen curtains white, wool rug grey, pendant lamp\"\n"
+        f"      \"prompt_imagen\": \"Photorealistic interior photo, {style} style room after home staging, [specific furniture and decor], warm natural light, 4k quality\"\n"
         "    }}\n"
         "  ],\n"
         "  \"riepilogo_costi\": {{\n"
@@ -289,13 +282,7 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
 
     data = response.json()
     text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    result = json.loads(text) if text.startswith("{") else _extract_json(text)
-
-    for room in result.get("stanze", []):
-        oggetti = room.get("oggetti_da_sostituire", "minimalist furniture and decor")
-        room["prompt_imagen"] = _build_imagen_prompt(style, oggetti)
-
-    return result
+    return json.loads(text) if text.startswith("{") else _extract_json(text)
 
 
 async def generate_staged_photos(photos: list, analysis: dict) -> list:
@@ -304,12 +291,10 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
     tasks  = []
 
     for room in stanze:
-        idx    = room.get("indice_foto", 0)
         prompt = room.get("prompt_imagen", "")
-        if idx < len(photos) and prompt:
-            photo_bytes = photos[idx]["content"]
+        if prompt:
             tasks.append(loop.run_in_executor(
-                _imagen_executor, _gemini_image_edit_sync, photo_bytes, prompt
+                _imagen_executor, _imagen_generate_sync, prompt
             ))
         else:
             tasks.append(_noop())
@@ -318,53 +303,43 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
     output  = []
     for r in results:
         if isinstance(r, Exception):
-            print(f"[GeminiImage] task fallito: {r}")
+            print(f"[Imagen] task fallito: {r}")
             output.append(None)
         else:
             output.append(r)
     return output
 
 
-def _gemini_image_edit_sync(photo_bytes: bytes, prompt: str) -> str | None:
+def _imagen_generate_sync(prompt: str) -> str | None:
+    """
+    Genera foto staged con imagen-3.0-generate-002 via google-genai SDK.
+    Usa generate_images() — metodo nativo del nuovo SDK, diverso dal vecchio
+    vertexai SDK che usava imagegeneration@006 (deprecato).
+    """
     try:
-        compressed = compress_image(photo_bytes, max_width=1200, quality=85)
-        print(f"[GeminiImage] START {len(photo_bytes)//1024}KB -> {len(compressed)//1024}KB")
-
+        print(f"[Imagen] generazione con prompt: {prompt[:80]}")
         client = _get_genai_client()
 
-        full_prompt = (
-            "Image-to-Image transformation. " + prompt + "\n\n"
-            "CRITICAL: Do not move structural elements like windows, doors, "
-            "and load-bearing walls. Maintain the exact room geometry, "
-            "perspective, camera angle, walls, floor, ceiling and door positions. "
-            "Only replace the furniture, curtains, rugs, and decorative objects."
-        )
-
-        response = client.models.generate_content(
-            model="gemini-2.0-flash-exp",
-            contents=[
-                genai_types.Part.from_bytes(data=compressed, mime_type="image/jpeg"),
-                genai_types.Part.from_text(text=full_prompt),
-            ],
-            config=genai_types.GenerateContentConfig(
-                response_modalities=["Text", "Image"],
-                temperature=1.0,
+        response = client.models.generate_images(
+            model="imagen-3.0-generate-002",
+            prompt=prompt,
+            config=genai_types.GenerateImagesConfig(
+                number_of_images=1,
+                aspect_ratio="4:3",
+                safety_filter_level="block_only_high",
             ),
         )
 
-        print(f"[GeminiImage] risposta ricevuta")
-        for part in response.candidates[0].content.parts:
-            if part.inline_data is not None:
-                print(f"[GeminiImage] SUCCESS mime={part.inline_data.mime_type}")
-                return base64.b64encode(part.inline_data.data).decode()
-            elif part.text:
-                print(f"[GeminiImage] testo: {part.text[:100]}")
+        if response.generated_images:
+            img = response.generated_images[0]
+            print(f"[Imagen] SUCCESS")
+            return base64.b64encode(img.image.image_bytes).decode()
 
-        print("[GeminiImage] nessuna immagine nei parts")
+        print("[Imagen] nessuna immagine generata")
         return None
 
     except Exception as e:
         import traceback
-        print(f"[GeminiImage] ERRORE: {type(e).__name__}: {e}")
+        print(f"[Imagen] ERRORE: {type(e).__name__}: {e}")
         print(traceback.format_exc())
         return None
