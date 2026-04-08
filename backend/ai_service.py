@@ -1,8 +1,7 @@
 """
-AI Service v9
-- Gemini 2.5 Flash via REST API per analisi JSON
-- imagen-3.0-generate-002 via google-genai SDK per staged photos
-  (generate_images con prompt dettagliato dalla descrizione Gemini)
+AI Service v10
+- Gemini 2.5 Flash via REST API (API key) per analisi JSON
+- Imagen 3 via google-genai SDK con vertexai=True (service account) per foto staged
 """
 import asyncio
 import base64
@@ -29,20 +28,29 @@ LOCATION       = os.environ.get("GCP_LOCATION", "us-central1")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 print(f"[startup] PROJECT_ID={PROJECT_ID!r}")
+print(f"[startup] LOCATION={LOCATION!r}")
 print(f"[startup] GEMINI_API_KEY={'SET' if GEMINI_API_KEY else 'MISSING'}")
 
+# Client per analisi testo — usa API key (Gemini 2.5 Flash)
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
 )
 
-_genai_client = None
+# Client per immagini — usa Vertex AI (service account automatico su Cloud Run)
+_vertex_client = None
 
-def _get_genai_client():
-    global _genai_client
-    if _genai_client is None:
-        _genai_client = genai.Client(api_key=GEMINI_API_KEY)
-    return _genai_client
+def _get_vertex_client():
+    global _vertex_client
+    if _vertex_client is None:
+        print(f"[Imagen] init Vertex AI client project={PROJECT_ID} location={LOCATION}")
+        _vertex_client = genai.Client(
+            vertexai=True,
+            project=PROJECT_ID,
+            location=LOCATION,
+        )
+    return _vertex_client
+
 
 _gemini_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="gemini")
 _imagen_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="imagen")
@@ -197,17 +205,17 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         f"riepilogo_costi.budget_residuo = {budget} - totale.\n\n"
         f"REGOLA prompt_imagen:\n"
         f"Scrivi un prompt fotografico professionale in inglese per Imagen 3.\n"
-        f"Deve descrivere la stanza DOPO il restyling in stile {style}.\n"
-        f"Includi: tipo stanza, stile {style}, colori, materiali specifici degli arredi,\n"
-        f"illuminazione, atmosfera. Max 60 parole. NON menzionare pareti o finestre.\n"
-        f"Esempio: \"Photorealistic interior photo, Scandinavian living room after staging,\n"
-        f"light oak furniture, white linen sofa, grey wool rug, pendant lamp,\n"
-        f"green plants, warm natural light, minimalist decor, 4k quality\"\n\n"
+        f"Descrivi la stanza DOPO il restyling in stile {style}.\n"
+        f"Includi: tipo stanza, materiali e colori specifici degli arredi nello stile {style},\n"
+        f"illuminazione naturale, atmosfera accogliente. Max 50 parole.\n"
+        f"Esempio per stile Scandinavo soggiorno:\n"
+        f"\"Photorealistic interior, Scandinavian living room, light oak coffee table,\n"
+        f"grey linen sofa, wool rug, pendant lamp, potted plants, warm natural light, 4k\"\n\n"
         f"Restituisci SOLO questo JSON (costi come interi):\n\n"
         "{{\n"
-        "  \"valutazione_generale\": \"analisi visiva dettagliata\",\n"
-        "  \"punti_di_forza\": [\"punto 1\", \"punto 2\", \"punto 3\"],\n"
-        "  \"criticita\": [\"critica 1\", \"critica 2\"],\n"
+        "  \"valutazione_generale\": \"analisi visiva\",\n"
+        "  \"punti_di_forza\": [\"p1\", \"p2\", \"p3\"],\n"
+        "  \"criticita\": [\"c1\", \"c2\"],\n"
         f"  \"potenziale_str\": \"potenziale per {dest_label} a {location}\",\n"
         "  \"tariffe\": {{\n"
         "    \"attuale_notte\": \"\u20acXX-YY\",\n"
@@ -218,19 +226,19 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "    {{\n"
         "      \"nome\": \"Soggiorno\",\n"
         "      \"indice_foto\": 0,\n"
-        "      \"stato_attuale\": \"descrizione stato attuale\",\n"
+        "      \"stato_attuale\": \"descrizione\",\n"
         "      \"interventi\": [\n"
         "        {{\n"
         "          \"titolo\": \"nome breve\",\n"
-        f"          \"dettaglio\": \"prodotti, brand, prezzo, tariffa {location}\",\n"
+        f"          \"dettaglio\": \"prodotti, brand, prezzo {location}\",\n"
         "          \"costo_min\": 50,\n"
         "          \"costo_max\": 120,\n"
         "          \"priorita\": \"alta\",\n"
-        f"          \"dove_comprare\": \"negozio per {style}\"\n"
+        f"          \"dove_comprare\": \"negozio {style}\"\n"
         "        }}\n"
         "      ],\n"
         "      \"costo_totale_stanza\": 350,\n"
-        f"      \"prompt_imagen\": \"Photorealistic interior photo, {style} style room after home staging, [specific furniture and decor], warm natural light, 4k quality\"\n"
+        f"      \"prompt_imagen\": \"Photorealistic interior, {style} style room, [specific furniture and colors], warm natural light, 4k\"\n"
         "    }}\n"
         "  ],\n"
         "  \"riepilogo_costi\": {{\n"
@@ -245,14 +253,14 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "  \"piano_acquisti\": [\n"
         "    {{\n"
         "      \"categoria\": \"Tessili\",\n"
-        f"      \"articoli\": [\"item per {style}\"],\n"
+        f"      \"articoli\": [\"item {style}\"],\n"
         "      \"budget_stimato\": 0,\n"
-        f"      \"negozi_consigliati\": \"negozi per {style}\"\n"
+        f"      \"negozi_consigliati\": \"negozi {style}\"\n"
         "    }}\n"
         "  ],\n"
-        "  \"titolo_annuncio_suggerito\": \"Titolo Airbnb max 50 caratteri\",\n"
-        "  \"highlights_str\": [\"highlight 1\", \"highlight 2\", \"highlight 3\"],\n"
-        "  \"roi_restyling\": \"ROI: \u20acX investimento, +\u20acY/notte, break-even Z notti\"\n"
+        "  \"titolo_annuncio_suggerito\": \"Titolo Airbnb max 50 car\",\n"
+        "  \"highlights_str\": [\"h1\", \"h2\", \"h3\"],\n"
+        "  \"roi_restyling\": \"ROI: \u20acX, +\u20acY/notte, break-even Z notti\"\n"
         "}}"
     )
 
@@ -312,13 +320,13 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
 
 def _imagen_generate_sync(prompt: str) -> str | None:
     """
-    Genera foto staged con imagen-3.0-generate-002 via google-genai SDK.
-    Usa generate_images() — metodo nativo del nuovo SDK, diverso dal vecchio
-    vertexai SDK che usava imagegeneration@006 (deprecato).
+    Genera foto staged con Imagen 3 via Vertex AI.
+    Usa google-genai SDK con vertexai=True — autenticazione automatica
+    tramite service account di Cloud Run (no API key necessaria).
     """
     try:
-        print(f"[Imagen] generazione con prompt: {prompt[:80]}")
-        client = _get_genai_client()
+        print(f"[Imagen] prompt: {prompt[:80]}")
+        client = _get_vertex_client()
 
         response = client.models.generate_images(
             model="imagen-3.0-generate-002",
@@ -331,9 +339,10 @@ def _imagen_generate_sync(prompt: str) -> str | None:
         )
 
         if response.generated_images:
-            img = response.generated_images[0]
-            print(f"[Imagen] SUCCESS")
-            return base64.b64encode(img.image.image_bytes).decode()
+            print("[Imagen] SUCCESS")
+            return base64.b64encode(
+                response.generated_images[0].image.image_bytes
+            ).decode()
 
         print("[Imagen] nessuna immagine generata")
         return None
