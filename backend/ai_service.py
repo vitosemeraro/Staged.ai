@@ -46,7 +46,7 @@ GEMINI_URL = (
 # gemini-2.5-flash-image: sostituto ufficiale di tutti i modelli Imagen
 GEMINI_IMAGE_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-2.0-flash-exp:generateContent?key={GEMINI_API_KEY}"
+    f"gemini-2.0-flash-preview-image-generation:generateContent?key={GEMINI_API_KEY}"
 )
 
 _gemini_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="gemini")
