@@ -70,14 +70,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .room-cost { font-size:14pt; font-weight:700; }
   .room-status { font-size:10.5pt; color:#777; margin-bottom:18px; }
   .photos-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:26px; }
-  /* Griglia 4 approcci AI */
-  .approaches-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:26px; }
-  .approach-card { border:1px solid #e0e0e0; border-radius:6px; overflow:hidden; }
-  .approach-label { font-size:7.5pt; text-transform:uppercase; letter-spacing:1px; color:#888;
-                    padding:4px 8px; background:#f5f5f3; border-bottom:1px solid #e0e0e0; }
-  .approach-img { width:100%; height:140px; object-fit:contain; background:#f0eeea; display:block; }
-  .approach-placeholder { width:100%; height:140px; background:#f0eeea; display:flex;
-                           align-items:center; justify-content:center; font-size:8pt; color:#ccc; }
+  /* Layout C-variants */
+  .c-variants-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:14px; }
+  .c-card { border:1px solid #ddd; border-radius:6px; overflow:hidden; page-break-inside:avoid; }
+  .c-card-header { padding:5px 8px; font-size:7.5pt; text-transform:uppercase;
+                   letter-spacing:1px; color:#fff; font-weight:700; }
+  .c-card-img { width:100%; height:130px; object-fit:contain; background:#f0eeea; display:block; }
+  .c-card-placeholder { width:100%; height:130px; background:#f0eeea; display:flex;
+                         align-items:center; justify-content:center; font-size:8pt; color:#ccc; }
+  .c-card-body { padding:6px 8px; }
+  .c-card-voce { font-size:8pt; color:#444; padding:1px 0; display:flex;
+                 justify-content:space-between; border-bottom:1px solid #f0f0f0; }
+  .c-card-voce:last-child { border-bottom:none; }
+  .c-card-total { font-size:8pt; font-weight:700; color:#2c2c2a; padding-top:4px;
+                  text-align:right; }
+  .c-base-row { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:10px; }
   .photo-label { font-size:8pt; text-transform:uppercase; letter-spacing:1.5px;
                  color:#888; margin-bottom:5px; }
   .room-photo { width:100%; max-height:220px; object-fit:contain; background:#f5f5f3; border-radius:6px; display:block; }
@@ -214,7 +221,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
   <p class="room-status">{{ room.stato_attuale }}</p>
 
-  <div class="photos-grid">
+  {# ── Riga 1: Prima + C base ── #}
+  <div class="c-base-row">
     <div>
       <div class="photo-label">Prima</div>
       {% if room.original_photo_b64 %}
@@ -225,34 +233,50 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="photo-placeholder">Foto originale non disponibile</div>
       {% endif %}
     </div>
-    <div style="display:flex;align-items:center;justify-content:center;">
-      <p style="font-size:9pt;color:#888;font-style:italic;">
-        Vedi sotto i 4 approcci AI a confronto
-      </p>
+    <div>
+      {% set sa = room.staged_approaches or {} %}
+      <div class="photo-label">C — Staged (riferimento geometrico)</div>
+      {% if sa.get('C_base') %}
+      <img class="room-photo"
+           src="data:image/png;base64,{{ sa['C_base'] }}"
+           alt="C base — {{ room.nome }}"/>
+      {% else %}
+      <div class="photo-placeholder">Non disponibile</div>
+      {% endif %}
     </div>
   </div>
 
-  {# ── 4 approcci AI a confronto ── #}
+  {# ── Griglia 4 varianti C con cartellino interventi ── #}
+  {% set c_variants = [
+    ("C1_SOFT",      "C1 — Soft",      "#7BAF6E"),
+    ("C2_CHROMATIC", "C2 — Chromatic", "#BA7517"),
+    ("C3_BOLD",      "C3 — Bold",      "#4A7FA5"),
+    ("C4_FULL",      "C4 — Full",      "#8B5E9C"),
+  ] %}
   <div class="photo-label" style="margin-bottom:6px;">
-    Simulazioni AI — 4 approcci a confronto (la disposizione reale può variare)
+    Varianti sperimentali — guidance scale crescente (la disposizione reale può variare)
   </div>
-  <div class="approaches-grid">
-    {% set approaches = [
-      ("A_base",      "A — Generate base"),
-      ("B_geometric", "B — Generate + vincoli geometrici"),
-      ("C_reference", "C — Generate + foto riferimento"),
-      ("D_edit",      "D — Edit inpainting nativo"),
-    ] %}
-    {% for key, label in approaches %}
-    {% set img = room.staged_approaches.get(key) if room.staged_approaches else None %}
-    <div class="approach-card">
-      <div class="approach-label">{{ label }}</div>
+  <div class="c-variants-grid">
+    {% for key, label, color in c_variants %}
+    {% set img = sa.get(key) %}
+    {% set esp = room.esperimenti_staged_map.get(key) if room.esperimenti_staged_map else {} %}
+    <div class="c-card">
+      <div class="c-card-header" style="background:{{ color }};">{{ label }}</div>
       {% if img %}
-      <img class="approach-img"
-           src="data:image/png;base64,{{ img }}"
-           alt="{{ label }}"/>
+      <img class="c-card-img" src="data:image/png;base64,{{ img }}" alt="{{ label }}"/>
       {% else %}
-      <div class="approach-placeholder">Non disponibile</div>
+      <div class="c-card-placeholder">Non disponibile</div>
+      {% endif %}
+      {% if esp %}
+      <div class="c-card-body">
+        {% for iv in esp.get('interventi_lista', []) %}
+        <div class="c-card-voce">
+          <span>{{ iv.voce }}</span>
+          <span>€{{ iv.costo }}</span>
+        </div>
+        {% endfor %}
+        <div class="c-card-total">Budget: €{{ esp.get('costo_simulato', '—') }}</div>
+      </div>
       {% endif %}
     </div>
     {% endfor %}
@@ -348,9 +372,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 def generate_pdf(analysis: dict, prefs: dict, photos: list,
                 staged_results: list | None = None) -> bytes:
     """
-    Embed original photos and staged photos (multi-approach) into the PDF.
-    staged_results: lista di dict per ogni stanza con chiavi A_base, B_geometric,
-                    C_reference, D_edit (o None se non disponibili).
+    Embed original + staged multi-approach photos into the PDF.
+    staged_results: lista di dict per stanza con chiavi A_base, B_geometric,
+                    C_base, C1_SOFT, C2_CHROMATIC, C3_BOLD, C4_FULL.
     """
     for i, room in enumerate(analysis.get("stanze", [])):
         idx = room.get("indice_foto", 0)
@@ -362,11 +386,18 @@ def generate_pdf(analysis: dict, prefs: dict, photos: list,
             room.setdefault("original_photo_b64", None)
             room.setdefault("original_photo_mime", "image/jpeg")
 
-        # Attach multi-approach staged photos
+        # Attach staged approaches
         if staged_results and i < len(staged_results):
             room["staged_approaches"] = staged_results[i] or {}
         else:
             room["staged_approaches"] = {}
+
+        # Build esperimenti_staged_map: logic_id -> esperimento dict
+        room["esperimenti_staged_map"] = {
+            esp["logic_id"]: esp
+            for esp in room.get("esperimenti_staged", [])
+            if "logic_id" in esp
+        }
 
     html_str = Template(HTML_TEMPLATE).render(
         analysis=analysis,
