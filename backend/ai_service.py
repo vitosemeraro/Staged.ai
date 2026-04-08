@@ -1,7 +1,10 @@
 """
-AI Service v10
-- Gemini 2.5 Flash via REST API (API key) per analisi JSON
-- Imagen 3 via google-genai SDK con vertexai=True (service account) per foto staged
+AI Service v11 — Multi-approach staging
+Genera 4 varianti per ogni stanza per confronto:
+  A: generate_images prompt base (attuale, funziona)
+  B: generate_images prompt geometrico pesante
+  C: generate_images con reference_image (foto originale come ancora)
+  D: edit_image con imagen-3.0-capability-001 (inpainting nativo)
 """
 import asyncio
 import base64
@@ -31,29 +34,22 @@ print(f"[startup] PROJECT_ID={PROJECT_ID!r}")
 print(f"[startup] LOCATION={LOCATION!r}")
 print(f"[startup] GEMINI_API_KEY={'SET' if GEMINI_API_KEY else 'MISSING'}")
 
-# Client per analisi testo — usa API key (Gemini 2.5 Flash)
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
 )
 
-# Client per immagini — usa Vertex AI (service account automatico su Cloud Run)
 _vertex_client = None
 
 def _get_vertex_client():
     global _vertex_client
     if _vertex_client is None:
         print(f"[Imagen] init Vertex AI client project={PROJECT_ID} location={LOCATION}")
-        _vertex_client = genai.Client(
-            vertexai=True,
-            project=PROJECT_ID,
-            location=LOCATION,
-        )
+        _vertex_client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
     return _vertex_client
 
-
 _gemini_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="gemini")
-_imagen_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="imagen")
+_imagen_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="imagen")
 
 _analysis_cache: dict[str, dict] = {}
 
@@ -293,41 +289,98 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
     return json.loads(text) if text.startswith("{") else _extract_json(text)
 
 
+# ── MULTI-APPROACH STAGED PHOTOS ──────────────────────────────────────────────
+#
+# generate_staged_photos ora restituisce una lista di dizionari:
+# [
+#   {
+#     "A_base":      "<base64>",   # generate_images prompt semplice
+#     "B_geometric": "<base64>",   # generate_images prompt geometrico
+#     "C_reference": "<base64>",   # generate_images con foto come reference
+#     "D_edit":      "<base64>",   # edit_image inpainting nativo
+#   },
+#   ...  (un dict per ogni stanza)
+# ]
+# Il PDF mostrerà tutte e 4 le varianti per ogni stanza.
+
+APPROACH_LABELS = {
+    "A_base":      "A — Generate base",
+    "B_geometric": "B — Generate geometric",
+    "C_reference": "C — Generate + reference",
+    "D_edit":      "D — Edit inpainting",
+}
+
+
 async def generate_staged_photos(photos: list, analysis: dict) -> list:
     stanze = analysis.get("stanze", [])
     loop   = asyncio.get_running_loop()
-    tasks  = []
+    # Ogni elemento della lista risultante è un dict con le 4 varianti
+    room_tasks = []
 
     for room in stanze:
+        idx    = room.get("indice_foto", 0)
         prompt = room.get("prompt_imagen", "")
-        if prompt:
-            tasks.append(loop.run_in_executor(
-                _imagen_executor, _imagen_generate_sync, prompt
-            ))
+        photo_bytes = photos[idx]["content"] if idx < len(photos) else None
+
+        if not prompt:
+            room_tasks.append(None)
+            continue
+
+        room_tasks.append((photo_bytes, prompt))
+
+    # Lancia tutti gli approcci per tutte le stanze in parallelo
+    all_futures = []
+    room_indices = []
+
+    for i, task in enumerate(room_tasks):
+        if task is None:
+            continue
+        photo_bytes, prompt = task
+        room_indices.append(i)
+
+        # A: generate_images con prompt base (funziona, è la baseline)
+        all_futures.append(("A_base", i,
+            loop.run_in_executor(_imagen_executor, _approach_A_base, prompt)
+        ))
+        # B: generate_images con prompt geometrico pesante
+        all_futures.append(("B_geometric", i,
+            loop.run_in_executor(_imagen_executor, _approach_B_geometric, prompt)
+        ))
+        # C: generate_images con reference_image (foto originale come ancora visiva)
+        all_futures.append(("C_reference", i,
+            loop.run_in_executor(_imagen_executor, _approach_C_reference,
+                                 photo_bytes, prompt)
+        ))
+        # D: edit_image inpainting nativo con imagen-3.0-capability-001
+        all_futures.append(("D_edit", i,
+            loop.run_in_executor(_imagen_executor, _approach_D_edit,
+                                 photo_bytes, prompt)
+        ))
+
+    # Raccoglie risultati
+    results = [{} for _ in stanze]
+
+    gathered = await asyncio.gather(
+        *[f for _, _, f in all_futures],
+        return_exceptions=True
+    )
+
+    for (approach, room_idx, _), result in zip(all_futures, gathered):
+        if isinstance(result, Exception):
+            print(f"[Approccio {approach} stanza {room_idx}] ERRORE: {result}")
+            results[room_idx][approach] = None
         else:
-            tasks.append(_noop())
+            results[room_idx][approach] = result
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    output  = []
-    for r in results:
-        if isinstance(r, Exception):
-            print(f"[Imagen] task fallito: {r}")
-            output.append(None)
-        else:
-            output.append(r)
-    return output
+    return results
 
 
-def _imagen_generate_sync(prompt: str) -> str | None:
-    """
-    Genera foto staged con Imagen 3 via Vertex AI.
-    Usa google-genai SDK con vertexai=True — autenticazione automatica
-    tramite service account di Cloud Run (no API key necessaria).
-    """
+# ── Approccio A: generate_images prompt base ─────────────────────────────────
+
+def _approach_A_base(prompt: str) -> str | None:
     try:
-        print(f"[Imagen] prompt: {prompt[:80]}")
+        print(f"[A_base] prompt: {prompt[:60]}")
         client = _get_vertex_client()
-
         response = client.models.generate_images(
             model="imagen-3.0-generate-002",
             prompt=prompt,
@@ -337,18 +390,127 @@ def _imagen_generate_sync(prompt: str) -> str | None:
                 safety_filter_level="block_only_high",
             ),
         )
-
         if response.generated_images:
-            print("[Imagen] SUCCESS")
+            print("[A_base] SUCCESS")
             return base64.b64encode(
                 response.generated_images[0].image.image_bytes
             ).decode()
-
-        print("[Imagen] nessuna immagine generata")
+        return None
+    except Exception as e:
+        print(f"[A_base] ERRORE: {type(e).__name__}: {e}")
         return None
 
+
+# ── Approccio B: generate_images prompt geometrico pesante ───────────────────
+
+def _approach_B_geometric(prompt: str) -> str | None:
+    try:
+        geo_prompt = (
+            "Maintain exactly the same room layout, window positions, wall colors "
+            "and floor material as the reference. Only replace movable furniture and decor. "
+            + prompt
+            + " Negative: moving walls, changing window shapes, different floor, "
+            "distorted architecture, different room proportions."
+        )
+        print(f"[B_geometric] prompt: {geo_prompt[:60]}")
+        client = _get_vertex_client()
+        response = client.models.generate_images(
+            model="imagen-3.0-generate-002",
+            prompt=geo_prompt,
+            config=genai_types.GenerateImagesConfig(
+                number_of_images=1,
+                aspect_ratio="4:3",
+                safety_filter_level="block_only_high",
+            ),
+        )
+        if response.generated_images:
+            print("[B_geometric] SUCCESS")
+            return base64.b64encode(
+                response.generated_images[0].image.image_bytes
+            ).decode()
+        return None
     except Exception as e:
-        import traceback
-        print(f"[Imagen] ERRORE: {type(e).__name__}: {e}")
-        print(traceback.format_exc())
+        print(f"[B_geometric] ERRORE: {type(e).__name__}: {e}")
+        return None
+
+
+# ── Approccio C: generate_images con reference_image ────────────────────────
+
+def _approach_C_reference(photo_bytes: bytes | None, prompt: str) -> str | None:
+    if not photo_bytes:
+        print("[C_reference] nessuna foto originale, skip")
+        return None
+    try:
+        compressed = compress_image(photo_bytes, max_width=1024, quality=80)
+        print(f"[C_reference] foto: {len(compressed)//1024}KB, prompt: {prompt[:60]}")
+        client = _get_vertex_client()
+
+        # RawReferenceImage ancora l'output visivamente alla foto originale
+        raw_ref = genai_types.RawReferenceImage(
+            reference_id=1,
+            reference_image=genai_types.Image(image_bytes=compressed),
+        )
+        response = client.models.generate_images(
+            model="imagen-3.0-generate-002",
+            prompt=prompt,
+            config=genai_types.GenerateImagesConfig(
+                number_of_images=1,
+                aspect_ratio="4:3",
+                safety_filter_level="block_only_high",
+                reference_images=[raw_ref],
+            ),
+        )
+        if response.generated_images:
+            print("[C_reference] SUCCESS")
+            return base64.b64encode(
+                response.generated_images[0].image.image_bytes
+            ).decode()
+        return None
+    except Exception as e:
+        print(f"[C_reference] ERRORE: {type(e).__name__}: {e}")
+        return None
+
+
+# ── Approccio D: edit_image inpainting nativo ────────────────────────────────
+
+def _approach_D_edit(photo_bytes: bytes | None, prompt: str) -> str | None:
+    if not photo_bytes:
+        print("[D_edit] nessuna foto originale, skip")
+        return None
+    try:
+        compressed = compress_image(photo_bytes, max_width=1024, quality=80)
+        print(f"[D_edit] foto: {len(compressed)//1024}KB, prompt: {prompt[:60]}")
+        client = _get_vertex_client()
+
+        edit_prompt = (
+            "Home staging refurbishment of this existing room. "
+            + prompt
+            + " Keep the exact same walls, floor, windows and ceiling. "
+            "Replace only furniture, curtains, rugs and decorative objects."
+        )
+
+        response = client.models.edit_image(
+            model="imagen-3.0-capability-001",
+            prompt=edit_prompt,
+            reference_images=[
+                genai_types.RawReferenceImage(
+                    reference_id=1,
+                    reference_image=genai_types.Image(image_bytes=compressed),
+                )
+            ],
+            config=genai_types.EditImageConfig(
+                edit_mode=genai_types.EditMode.INPAINTING_INSERT,
+                number_of_images=1,
+                safety_filter_level="block_only_high",
+            ),
+        )
+        if response.generated_images:
+            print("[D_edit] SUCCESS")
+            return base64.b64encode(
+                response.generated_images[0].image.image_bytes
+            ).decode()
+        print("[D_edit] nessuna immagine generata")
+        return None
+    except Exception as e:
+        print(f"[D_edit] ERRORE: {type(e).__name__}: {e}")
         return None
