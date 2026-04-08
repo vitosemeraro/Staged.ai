@@ -70,6 +70,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .room-cost { font-size:14pt; font-weight:700; }
   .room-status { font-size:10.5pt; color:#777; margin-bottom:18px; }
   .photos-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:26px; }
+  /* Griglia 4 approcci AI */
+  .approaches-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:26px; }
+  .approach-card { border:1px solid #e0e0e0; border-radius:6px; overflow:hidden; }
+  .approach-label { font-size:7.5pt; text-transform:uppercase; letter-spacing:1px; color:#888;
+                    padding:4px 8px; background:#f5f5f3; border-bottom:1px solid #e0e0e0; }
+  .approach-img { width:100%; height:140px; object-fit:contain; background:#f0eeea; display:block; }
+  .approach-placeholder { width:100%; height:140px; background:#f0eeea; display:flex;
+                           align-items:center; justify-content:center; font-size:8pt; color:#ccc; }
   .photo-label { font-size:8pt; text-transform:uppercase; letter-spacing:1.5px;
                  color:#888; margin-bottom:5px; }
   .room-photo { width:100%; max-height:220px; object-fit:contain; background:#f5f5f3; border-radius:6px; display:block; }
@@ -217,16 +225,37 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="photo-placeholder">Foto originale non disponibile</div>
       {% endif %}
     </div>
-    <div>
-      <div class="photo-label">Dopo — simulazione AI (la disposizione reale può variare)</div>
-      {% if room.staged_photo_b64 %}
-      <img class="room-photo"
-           src="data:image/png;base64,{{ room.staged_photo_b64 }}"
-           alt="Dopo — {{ room.nome }}"/>
+    <div style="display:flex;align-items:center;justify-content:center;">
+      <p style="font-size:9pt;color:#888;font-style:italic;">
+        Vedi sotto i 4 approcci AI a confronto
+      </p>
+    </div>
+  </div>
+
+  {# ── 4 approcci AI a confronto ── #}
+  <div class="photo-label" style="margin-bottom:6px;">
+    Simulazioni AI — 4 approcci a confronto (la disposizione reale può variare)
+  </div>
+  <div class="approaches-grid">
+    {% set approaches = [
+      ("A_base",      "A — Generate base"),
+      ("B_geometric", "B — Generate + vincoli geometrici"),
+      ("C_reference", "C — Generate + foto riferimento"),
+      ("D_edit",      "D — Edit inpainting nativo"),
+    ] %}
+    {% for key, label in approaches %}
+    {% set img = room.staged_approaches.get(key) if room.staged_approaches else None %}
+    <div class="approach-card">
+      <div class="approach-label">{{ label }}</div>
+      {% if img %}
+      <img class="approach-img"
+           src="data:image/png;base64,{{ img }}"
+           alt="{{ label }}"/>
       {% else %}
-      <div class="photo-placeholder">Foto staged non disponibile</div>
+      <div class="approach-placeholder">Non disponibile</div>
       {% endif %}
     </div>
+    {% endfor %}
   </div>
 
   <div class="int-section-title">Interventi</div>
@@ -316,22 +345,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </html>"""
 
 
-def generate_pdf(analysis: dict, prefs: dict, photos: list) -> bytes:
+def generate_pdf(analysis: dict, prefs: dict, photos: list,
+                staged_results: list | None = None) -> bytes:
     """
-    Embed original photos (from photos list) and staged photos (already in
-    analysis.stanze[i].staged_photo_b64) into the PDF template, then render.
+    Embed original photos and staged photos (multi-approach) into the PDF.
+    staged_results: lista di dict per ogni stanza con chiavi A_base, B_geometric,
+                    C_reference, D_edit (o None se non disponibili).
     """
-    for room in analysis.get("stanze", []):
+    for i, room in enumerate(analysis.get("stanze", [])):
         idx = room.get("indice_foto", 0)
         if idx < len(photos):
-            # Comprime la foto originale prima di embedderla nel PDF
-            # (tipicamente da 3-5 MB a 200-400 KB — PDF finale < 8 MB)
             raw_bytes = compress_image(photos[idx]["content"], max_width=1400, quality=82)
             room["original_photo_b64"]  = base64.b64encode(raw_bytes).decode()
-            room["original_photo_mime"] = "image/jpeg"  # compress_image restituisce sempre JPEG
+            room["original_photo_mime"] = "image/jpeg"
         else:
             room.setdefault("original_photo_b64", None)
             room.setdefault("original_photo_mime", "image/jpeg")
+
+        # Attach multi-approach staged photos
+        if staged_results and i < len(staged_results):
+            room["staged_approaches"] = staged_results[i] or {}
+        else:
+            room["staged_approaches"] = {}
 
     html_str = Template(HTML_TEMPLATE).render(
         analysis=analysis,
