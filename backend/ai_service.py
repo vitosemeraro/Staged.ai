@@ -62,7 +62,10 @@ def compress_image(img_bytes: bytes, max_width: int = 1200, quality: int = 85) -
     if not HAS_PIL:
         return img_bytes
     try:
-        img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+        from PIL import ImageOps
+        img = PILImage.open(io.BytesIO(img_bytes))
+        img = ImageOps.exif_transpose(img)  # corregge rotazione foto da mobile
+        img = img.convert("RGB")
         if img.width > max_width:
             ratio = max_width / img.width
             img   = img.resize((max_width, int(img.height * ratio)), PILImage.LANCZOS)
@@ -434,7 +437,9 @@ def _approach_B_geometric(prompt: str) -> str | None:
         return None
 
 
-# ── Approccio C: generate_images con reference_image ────────────────────────
+# ── Approccio C: edit_image DEFAULT — RawReferenceImage senza maschera ─────
+# Passa la foto originale come riferimento visivo puro.
+# Imagen capisce la geometria e applica lo stile senza una maschera esplicita.
 
 def _approach_C_reference(photo_bytes: bytes | None, prompt: str) -> str | None:
     if not photo_bytes:
@@ -445,48 +450,10 @@ def _approach_C_reference(photo_bytes: bytes | None, prompt: str) -> str | None:
         print(f"[C_reference] foto: {len(compressed)//1024}KB, prompt: {prompt[:60]}")
         client = _get_vertex_client()
 
-        # RawReferenceImage ancora l'output visivamente alla foto originale
-        raw_ref = genai_types.RawReferenceImage(
-            reference_id=1,
-            reference_image=genai_types.Image(image_bytes=compressed),
-        )
-        response = client.models.generate_images(
-            model="imagen-3.0-generate-002",
-            prompt=prompt,
-            config=genai_types.GenerateImagesConfig(
-                number_of_images=1,
-                aspect_ratio="4:3",
-                safety_filter_level="block_only_high",
-                reference_images=[raw_ref],
-            ),
-        )
-        if response.generated_images:
-            print("[C_reference] SUCCESS")
-            return base64.b64encode(
-                response.generated_images[0].image.image_bytes
-            ).decode()
-        return None
-    except Exception as e:
-        print(f"[C_reference] ERRORE: {type(e).__name__}: {e}")
-        return None
-
-
-# ── Approccio D: edit_image inpainting nativo ────────────────────────────────
-
-def _approach_D_edit(photo_bytes: bytes | None, prompt: str) -> str | None:
-    if not photo_bytes:
-        print("[D_edit] nessuna foto originale, skip")
-        return None
-    try:
-        compressed = compress_image(photo_bytes, max_width=1024, quality=80)
-        print(f"[D_edit] foto: {len(compressed)//1024}KB, prompt: {prompt[:60]}")
-        client = _get_vertex_client()
-
         edit_prompt = (
-            "Home staging refurbishment of this existing room. "
+            "Home staging transformation of this existing room. "
             + prompt
-            + " Keep the exact same walls, floor, windows and ceiling. "
-            "Replace only furniture, curtains, rugs and decorative objects."
+            + " Keep the exact same walls, floor, windows and ceiling structure."
         )
 
         response = client.models.edit_image(
@@ -499,7 +466,60 @@ def _approach_D_edit(photo_bytes: bytes | None, prompt: str) -> str | None:
                 )
             ],
             config=genai_types.EditImageConfig(
-                edit_mode=genai_types.EditMode.INPAINTING_INSERT,
+                edit_mode="EDIT_MODE_DEFAULT",
+                number_of_images=1,
+                safety_filter_level="block_only_high",
+            ),
+        )
+        if response.generated_images:
+            print("[C_reference] SUCCESS")
+            return base64.b64encode(
+                response.generated_images[0].image.image_bytes
+            ).decode()
+        print("[C_reference] nessuna immagine")
+        return None
+    except Exception as e:
+        print(f"[C_reference] ERRORE: {type(e).__name__}: {e}")
+        return None
+
+
+# ── Approccio D: edit_image INPAINT_INSERTION con maschera foreground ────────
+# MaskReferenceImage con MASK_MODE_FOREGROUND maschera automaticamente
+# i mobili (foreground) lasciando intatte pareti e pavimenti (background).
+
+def _approach_D_edit(photo_bytes: bytes | None, prompt: str) -> str | None:
+    if not photo_bytes:
+        print("[D_edit] nessuna foto originale, skip")
+        return None
+    try:
+        compressed = compress_image(photo_bytes, max_width=1024, quality=80)
+        print(f"[D_edit] foto: {len(compressed)//1024}KB, prompt: {prompt[:60]}")
+        client = _get_vertex_client()
+
+        edit_prompt = (
+            "Replace the furniture and decor with home staging style. "
+            + prompt
+            + " Keep walls, floor, windows and ceiling unchanged."
+        )
+
+        response = client.models.edit_image(
+            model="imagen-3.0-capability-001",
+            prompt=edit_prompt,
+            reference_images=[
+                genai_types.RawReferenceImage(
+                    reference_id=1,
+                    reference_image=genai_types.Image(image_bytes=compressed),
+                ),
+                genai_types.MaskReferenceImage(
+                    reference_id=2,
+                    config=genai_types.MaskReferenceConfig(
+                        mask_mode="MASK_MODE_FOREGROUND",
+                        mask_dilation=0.03,
+                    ),
+                ),
+            ],
+            config=genai_types.EditImageConfig(
+                edit_mode="EDIT_MODE_INPAINT_INSERTION",
                 number_of_images=1,
                 safety_filter_level="block_only_high",
             ),
