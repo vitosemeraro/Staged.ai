@@ -344,7 +344,7 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 16384,
+            "maxOutputTokens": 65536,
             "responseMimeType": "application/json"
         }
     }
@@ -355,7 +355,7 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
 
     data = response.json()
     text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    return json.loads(text) if text.startswith("{") else _extract_json(text)
+    return _extract_json(text)
 
 
 # ── STAGED PHOTOS ─────────────────────────────────────────────────────────────
