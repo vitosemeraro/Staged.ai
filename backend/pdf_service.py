@@ -70,21 +70,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .room-cost { font-size:14pt; font-weight:700; }
   .room-status { font-size:10.5pt; color:#777; margin-bottom:18px; }
   .photos-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:26px; }
-  /* Layout C-variants */
-  .c-variants-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:14px; }
-  .c-card { border:1px solid #ddd; border-radius:6px; overflow:hidden; page-break-inside:avoid; }
-  .c-card-header { padding:5px 8px; font-size:7.5pt; text-transform:uppercase;
-                   letter-spacing:1px; color:#fff; font-weight:700; }
-  .c-card-img { width:100%; height:130px; object-fit:contain; background:#f0eeea; display:block; }
-  .c-card-placeholder { width:100%; height:130px; background:#f0eeea; display:flex;
-                         align-items:center; justify-content:center; font-size:8pt; color:#ccc; }
-  .c-card-body { padding:6px 8px; }
-  .c-card-voce { font-size:8pt; color:#444; padding:1px 0; display:flex;
-                 justify-content:space-between; border-bottom:1px solid #f0f0f0; }
-  .c-card-voce:last-child { border-bottom:none; }
-  .c-card-total { font-size:8pt; font-weight:700; color:#2c2c2a; padding-top:4px;
-                  text-align:right; }
-  .c-base-row { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:10px; }
+  /* Layout C4/C5 */
+  .staging-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-bottom:20px; }
+  .staging-col { }
+  .staging-label { font-size:7.5pt; text-transform:uppercase; letter-spacing:1.5px;
+                   color:#fff; font-weight:700; padding:4px 8px; border-radius:4px 4px 0 0; }
+  .staging-img { width:100%; height:150px; object-fit:contain; background:#f0eeea;
+                 display:block; border:1px solid #e8e8e8; border-top:none; border-radius:0 0 4px 4px; }
+  .staging-placeholder { width:100%; height:150px; background:#f0eeea; display:flex;
+                          align-items:center; justify-content:center; font-size:8pt; color:#ccc;
+                          border:1px solid #e8e8e8; border-top:none; border-radius:0 0 4px 4px; }
+  .staging-card-body { padding:6px 8px; border:1px solid #e8e8e8; border-top:none;
+                        border-radius:0 0 4px 4px; background:#fafaf9; }
+  .staging-voce { font-size:7.5pt; color:#555; padding:1px 0; display:flex;
+                  justify-content:space-between; border-bottom:1px solid #f0f0f0; }
+  .staging-voce:last-child { border-bottom:none; }
+  .staging-total { font-size:8pt; font-weight:700; color:#2c2c2a;
+                   padding-top:4px; text-align:right; }
   .photo-label { font-size:8pt; text-transform:uppercase; letter-spacing:1.5px;
                  color:#888; margin-bottom:5px; }
   .room-photo { width:100%; max-height:220px; object-fit:contain; background:#f5f5f3; border-radius:6px; display:block; }
@@ -221,65 +223,71 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
   <p class="room-status">{{ room.stato_attuale }}</p>
 
-  {# ── Riga 1: Prima + C base ── #}
-  <div class="c-base-row">
-    <div>
-      <div class="photo-label">Prima</div>
-      {% if room.original_photo_b64 %}
-      <img class="room-photo"
-           src="data:{{ room.original_photo_mime }};base64,{{ room.original_photo_b64 }}"
-           alt="Prima — {{ room.nome }}"/>
-      {% else %}
-      <div class="photo-placeholder">Foto originale non disponibile</div>
-      {% endif %}
-    </div>
-    <div>
-      {% set sa = room.staged_approaches or {} %}
-      <div class="photo-label">C — Staged (riferimento geometrico)</div>
-      {% if sa.get('C_base') %}
-      <img class="room-photo"
-           src="data:image/png;base64,{{ sa['C_base'] }}"
-           alt="C base — {{ room.nome }}"/>
-      {% else %}
-      <div class="photo-placeholder">Non disponibile</div>
-      {% endif %}
-    </div>
-  </div>
+  {# ── 3 colonne: Originale | C4 Full | C5 Smart Full ── #}
+  {% set sa = room.staged_approaches or {} %}
+  {% set c4_esp = room.esperimenti_staged_map.get('C4_FULL', {}) %}
+  {% set c5_esp = room.esperimenti_staged_map.get('C5_SMART_FULL', {}) %}
 
-  {# ── Griglia 4 varianti C con cartellino interventi ── #}
-  {% set c_variants = [
-    ("C1_SOFT",      "C1 — Soft",      "#7BAF6E"),
-    ("C2_CHROMATIC", "C2 — Chromatic", "#BA7517"),
-    ("C3_BOLD",      "C3 — Bold",      "#4A7FA5"),
-    ("C4_FULL",      "C4 — Full",      "#8B5E9C"),
-  ] %}
-  <div class="photo-label" style="margin-bottom:6px;">
-    Varianti sperimentali — guidance scale crescente (la disposizione reale può variare)
-  </div>
-  <div class="c-variants-grid">
-    {% for key, label, color in c_variants %}
-    {% set img = sa.get(key) %}
-    {% set esp = room.esperimenti_staged_map.get(key) if room.esperimenti_staged_map else {} %}
-    <div class="c-card">
-      <div class="c-card-header" style="background:{{ color }};">{{ label }}</div>
-      {% if img %}
-      <img class="c-card-img" src="data:image/png;base64,{{ img }}" alt="{{ label }}"/>
+  <div class="staging-grid">
+
+    {# Colonna 1: Originale #}
+    <div class="staging-col">
+      <div class="staging-label" style="background:#555;">Originale</div>
+      {% if room.original_photo_b64 %}
+      <img class="staging-img"
+           src="data:{{ room.original_photo_mime }};base64,{{ room.original_photo_b64 }}"
+           alt="Originale"/>
       {% else %}
-      <div class="c-card-placeholder">Non disponibile</div>
+      <div class="staging-placeholder">Non disponibile</div>
       {% endif %}
-      {% if esp %}
-      <div class="c-card-body">
-        {% for iv in esp.get('interventi_lista', []) %}
-        <div class="c-card-voce">
+    </div>
+
+    {# Colonna 2: C4 Full #}
+    <div class="staging-col">
+      <div class="staging-label" style="background:#8B5E9C;">C4 — Full Staging</div>
+      {% if sa.get('C4_FULL') %}
+      <img class="staging-img"
+           src="data:image/png;base64,{{ sa['C4_FULL'] }}"
+           alt="C4 Full"/>
+      {% else %}
+      <div class="staging-placeholder">Non disponibile</div>
+      {% endif %}
+      {% if c4_esp.get('interventi_lista') %}
+      <div class="staging-card-body">
+        {% for iv in c4_esp['interventi_lista'] %}
+        <div class="staging-voce">
           <span>{{ iv.voce }}</span>
           <span>€{{ iv.costo }}</span>
         </div>
         {% endfor %}
-        <div class="c-card-total">Budget: €{{ esp.get('costo_simulato', '—') }}</div>
+        <div class="staging-total">Budget: €{{ c4_esp.get('costo_simulato', '—') }}</div>
       </div>
       {% endif %}
     </div>
-    {% endfor %}
+
+    {# Colonna 3: C5 Smart Full #}
+    <div class="staging-col">
+      <div class="staging-label" style="background:#2E7D5E;">C5 — Smart Full ✦</div>
+      {% if sa.get('C5_SMART_FULL') %}
+      <img class="staging-img"
+           src="data:image/png;base64,{{ sa['C5_SMART_FULL'] }}"
+           alt="C5 Smart Full"/>
+      {% else %}
+      <div class="staging-placeholder">Non disponibile</div>
+      {% endif %}
+      {% if c5_esp.get('interventi_lista') %}
+      <div class="staging-card-body">
+        {% for iv in c5_esp['interventi_lista'] %}
+        <div class="staging-voce">
+          <span>{{ iv.voce }}</span>
+          <span>€{{ iv.costo }}</span>
+        </div>
+        {% endfor %}
+        <div class="staging-total">Budget: €{{ c5_esp.get('costo_simulato', '—') }}</div>
+      </div>
+      {% endif %}
+    </div>
+
   </div>
 
   <div class="int-section-title">Interventi</div>
@@ -372,9 +380,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 def generate_pdf(analysis: dict, prefs: dict, photos: list,
                 staged_results: list | None = None) -> bytes:
     """
-    Embed original + staged multi-approach photos into the PDF.
-    staged_results: lista di dict per stanza con chiavi A_base, B_geometric,
-                    C_base, C1_SOFT, C2_CHROMATIC, C3_BOLD, C4_FULL.
+    Layout per stanza: 3 colonne — Originale | C4 Full | C5 Smart Full
     """
     for i, room in enumerate(analysis.get("stanze", [])):
         idx = room.get("indice_foto", 0)
@@ -386,13 +392,7 @@ def generate_pdf(analysis: dict, prefs: dict, photos: list,
             room.setdefault("original_photo_b64", None)
             room.setdefault("original_photo_mime", "image/jpeg")
 
-        # Attach staged approaches
-        if staged_results and i < len(staged_results):
-            room["staged_approaches"] = staged_results[i] or {}
-        else:
-            room["staged_approaches"] = {}
-
-        # Build esperimenti_staged_map: logic_id -> esperimento dict
+        room["staged_approaches"] = (staged_results[i] or {}) if staged_results and i < len(staged_results) else {}
         room["esperimenti_staged_map"] = {
             esp["logic_id"]: esp
             for esp in room.get("esperimenti_staged", [])
