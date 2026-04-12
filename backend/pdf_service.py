@@ -1,11 +1,11 @@
 """
-PDF Service — WeasyPrint + Jinja2
-Produces a multi-page A4 PDF with:
-  - Cover page (metadata + tariffe)
-  - Valutazione generale
-  - One page per room: PRIMA / DOPO photos + interventi + costi
-  - Riepilogo costi + Piano acquisti
-  - Annuncio ottimizzato + ROI
+PDF Service — WeasyPrint + Jinja2 v15
+Layout per stanza: 4 colonne — Originale | C4 Full | C5 Smart | D Layering ★
+
+Fix:
+  - indice_foto fallback su i (non 0) per multi-foto
+  - 4° colonna D_FULL_SMART con badge dorato
+  - Counter "Stanza N di M"
 """
 import base64
 from datetime import date
@@ -64,45 +64,47 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .point.amber::before  { background:#BA7517; }
 
   /* ── Room pages ── */
-  .room-page { page-break-before:always; padding:50px; }
-  .room-header { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:6px; }
-  .room-name { font-family:'Playfair Display',serif; font-size:24pt; }
-  .room-cost { font-size:14pt; font-weight:700; }
-  .room-status { font-size:10.5pt; color:#777; margin-bottom:18px; }
-  .photos-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:26px; }
-  /* Layout C4/C5 */
-  .staging-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-bottom:20px; }
+  .room-page { page-break-before:always; padding:40px 50px; }
+  .room-counter { font-size:9pt; color:#aaa; text-transform:uppercase;
+                  letter-spacing:1.5px; margin-bottom:4px; }
+  .room-header { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:4px; }
+  .room-name { font-family:'Playfair Display',serif; font-size:22pt; }
+  .room-cost { font-size:13pt; font-weight:700; }
+  .room-status { font-size:10pt; color:#777; margin-bottom:14px; }
+
+  /* ── 4 colonne: Originale | C4 | C5 | D ── */
+  .staging-grid { display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:8px; margin-bottom:16px; }
   .staging-col { }
-  .staging-label { font-size:7.5pt; text-transform:uppercase; letter-spacing:1.5px;
-                   color:#fff; font-weight:700; padding:4px 8px; border-radius:4px 4px 0 0; }
-  .staging-img { width:100%; height:150px; object-fit:contain; background:#f0eeea;
-                 display:block; border:1px solid #e8e8e8; border-top:none; border-radius:0 0 4px 4px; }
-  .staging-placeholder { width:100%; height:150px; background:#f0eeea; display:flex;
-                          align-items:center; justify-content:center; font-size:8pt; color:#ccc;
-                          border:1px solid #e8e8e8; border-top:none; border-radius:0 0 4px 4px; }
-  .staging-card-body { padding:6px 8px; border:1px solid #e8e8e8; border-top:none;
+  .staging-label { font-size:6.5pt; text-transform:uppercase; letter-spacing:1px;
+                   color:#fff; font-weight:700; padding:3px 6px; border-radius:4px 4px 0 0;
+                   white-space:nowrap; overflow:hidden; }
+  .staging-img { width:100%; height:130px; object-fit:cover; background:#f0eeea;
+                 display:block; border:1px solid #e8e8e8; border-top:none; }
+  .staging-placeholder { width:100%; height:130px; background:#f0eeea; display:flex;
+                          align-items:center; justify-content:center; font-size:7pt; color:#ccc;
+                          border:1px solid #e8e8e8; border-top:none; }
+  .staging-card-body { padding:4px 6px; border:1px solid #e8e8e8; border-top:none;
                         border-radius:0 0 4px 4px; background:#fafaf9; }
-  .staging-voce { font-size:7.5pt; color:#555; padding:1px 0; display:flex;
+  .staging-voce { font-size:6.5pt; color:#555; padding:1px 0; display:flex;
                   justify-content:space-between; border-bottom:1px solid #f0f0f0; }
   .staging-voce:last-child { border-bottom:none; }
-  .staging-total { font-size:8pt; font-weight:700; color:#2c2c2a;
-                   padding-top:4px; text-align:right; }
-  .photo-label { font-size:8pt; text-transform:uppercase; letter-spacing:1.5px;
-                 color:#888; margin-bottom:5px; }
-  .room-photo { width:100%; max-height:220px; object-fit:contain; background:#f5f5f3; border-radius:6px; display:block; }
-  .photo-placeholder { width:100%; height:185px; background:#f0eeea; border-radius:6px;
-                       display:flex; align-items:center; justify-content:center;
-                       font-size:9pt; color:#bbb; }
+  .staging-total { font-size:7pt; font-weight:700; color:#2c2c2a;
+                   padding-top:3px; text-align:right; }
+
+  /* Badge D dorato */
+  .badge-d { background: linear-gradient(135deg, #B8860B, #DAA520); }
+
+  /* ── Interventi ── */
   .int-section-title { font-size:9pt; text-transform:uppercase; letter-spacing:1.5px;
-                       color:#888; margin-bottom:10px; font-weight:700; }
-  .intervention { border-left:3px solid #eee; padding:8px 0 8px 14px; margin-bottom:10px; }
+                       color:#888; margin-bottom:8px; font-weight:700; }
+  .intervention { border-left:3px solid #eee; padding:6px 0 6px 12px; margin-bottom:8px; }
   .int-row   { display:flex; justify-content:space-between; align-items:flex-start; }
-  .int-title { font-weight:700; font-size:10.5pt; }
-  .int-badge { font-size:7.5pt; padding:2px 8px; border-radius:3px;
-               color:#fff; font-weight:700; margin-left:8px; }
-  .int-cost  { font-size:10pt; font-weight:700; white-space:nowrap; margin-left:12px; }
-  .int-detail { font-size:10pt; color:#555; margin-top:3px; line-height:1.5; }
-  .int-where  { font-size:9pt; color:#aaa; margin-top:2px; }
+  .int-title { font-weight:700; font-size:10pt; }
+  .int-badge { font-size:7pt; padding:2px 7px; border-radius:3px;
+               color:#fff; font-weight:700; margin-left:7px; }
+  .int-cost  { font-size:10pt; font-weight:700; white-space:nowrap; margin-left:10px; }
+  .int-detail { font-size:9.5pt; color:#555; margin-top:2px; line-height:1.5; }
+  .int-where  { font-size:8.5pt; color:#aaa; margin-top:2px; }
 
   /* ── Costs summary ── */
   .costs-section { page-break-before:always; padding:50px; }
@@ -116,8 +118,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .shopping-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:18px 0; }
   .shop-card { border:1px solid #eee; border-radius:6px; padding:12px 14px; }
   .shop-header { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:4px; }
-  .shop-cat    { font-size:9pt; text-transform:uppercase; letter-spacing:1.5px;
-                 color:#888; font-weight:700; }
+  .shop-cat    { font-size:9pt; text-transform:uppercase; letter-spacing:1.5px; color:#888; font-weight:700; }
   .shop-budget { font-size:11pt; font-weight:700; }
   .shop-store  { font-size:9pt; color:#aaa; margin-bottom:6px; }
   .shop-item   { font-size:9.5pt; color:#555; padding-left:10px; position:relative; margin-top:3px; }
@@ -125,15 +126,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   /* ── Listing page ── */
   .listing-section { page-break-before:always; padding:50px; }
-  .listing-title-box { background:#2c2c2a; color:#fff; padding:20px 24px;
-                       border-radius:8px; margin:18px 0; }
+  .listing-title-box { background:#2c2c2a; color:#fff; padding:20px 24px; border-radius:8px; margin:18px 0; }
   .listing-title-text { font-family:'Playfair Display',serif; font-size:17pt; }
   .highlights { display:flex; flex-wrap:wrap; gap:8px; margin:16px 0; }
-  .highlight  { background:#f0eeea; padding:5px 12px; border-radius:3px;
-                font-size:9.5pt; color:#555; }
-  .roi-box { border-left:4px solid #639922; padding:12px 16px;
-             background:#f7fbf2; border-radius:0 6px 6px 0;
-             margin-top:20px; font-size:10.5pt; color:#3B6D11; line-height:1.7; }
+  .highlight  { background:#f0eeea; padding:5px 12px; border-radius:3px; font-size:9.5pt; color:#555; }
+  .roi-box { border-left:4px solid #639922; padding:12px 16px; background:#f7fbf2;
+             border-radius:0 6px 6px 0; margin-top:20px; font-size:10.5pt; color:#3B6D11; line-height:1.7; }
 
   /* ── Page numbers ── */
   @page { size:A4; margin:0;
@@ -150,6 +148,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="cover-sub">
       Scheda professionale per
       {{ 'affitto breve (Airbnb / Booking)' if prefs.destination == 'STR' else 'casa vacanza' }}
+      · {{ analysis.stanze | length }} stanz{{ 'a' if analysis.stanze | length == 1 else 'e' }} analizzat{{ 'a' if analysis.stanze | length == 1 else 'e' }}
     </div>
 
     <div class="cover-meta">
@@ -186,7 +185,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
     </div>
   </div>
-  <div class="footer-cover">Generato con Gemini 1.5 Pro · Imagen 3 · {{ today }}</div>
+  <div class="footer-cover">Generato con Gemini 2.5 Flash · Imagen 3 · {{ today }}</div>
 </div>
 
 {# ──────────────── VALUTAZIONE GENERALE ──────────────── #}
@@ -215,22 +214,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </div>
 
 {# ──────────────── ROOM PAGES ──────────────── #}
+{% set n_stanze = analysis.stanze | length %}
 {% for room in analysis.stanze %}
 <div class="room-page">
+  <div class="room-counter">Stanza {{ loop.index }} di {{ n_stanze }}</div>
   <div class="room-header">
     <div class="room-name">{{ room.nome }}</div>
     <div class="room-cost">€{{ room.costo_totale_stanza }}</div>
   </div>
   <p class="room-status">{{ room.stato_attuale }}</p>
 
-  {# ── 3 colonne: Originale | C4 Full | C5 Smart Full ── #}
-  {% set sa = room.staged_approaches or {} %}
+  {% set sa   = room.staged_approaches or {} %}
   {% set c4_esp = room.esperimenti_staged_map.get('C4_FULL', {}) %}
-  {% set d_esp = room.esperimenti_staged_map.get('D_FULL_SMART', {}) %}
+  {% set c5_esp = room.esperimenti_staged_map.get('C5_SMART_FULL', {}) %}
+  {% set d_esp  = room.esperimenti_staged_map.get('D_FULL_SMART', {}) %}
 
+  {# ── 4 colonne ── #}
   <div class="staging-grid">
 
-    {# Colonna 1: Originale #}
+    {# 1: Originale #}
     <div class="staging-col">
       <div class="staging-label" style="background:#555;">Originale</div>
       {% if room.original_photo_b64 %}
@@ -242,9 +244,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       {% endif %}
     </div>
 
-    {# Colonna 2: C4 Full #}
+    {# 2: C4 Full #}
     <div class="staging-col">
-      <div class="staging-label" style="background:#8B5E9C;">C4 — Full Staging</div>
+      <div class="staging-label" style="background:#8B5E9C;">C4 — Full</div>
       {% if sa.get('C4_FULL') %}
       <img class="staging-img"
            src="data:image/png;base64,{{ sa['C4_FULL'] }}"
@@ -255,35 +257,49 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       {% if c4_esp.get('interventi_lista') %}
       <div class="staging-card-body">
         {% for iv in c4_esp['interventi_lista'] %}
-        <div class="staging-voce">
-          <span>{{ iv.voce }}</span>
-          <span>€{{ iv.costo }}</span>
-        </div>
+        <div class="staging-voce"><span>{{ iv.voce }}</span><span>€{{ iv.costo }}</span></div>
         {% endfor %}
-        <div class="staging-total">Budget: €{{ c4_esp.get('costo_simulato', '—') }}</div>
+        <div class="staging-total">€{{ c4_esp.get('costo_simulato', '—') }}</div>
       </div>
       {% endif %}
     </div>
 
-    {# Colonna 3: C5 Smart Full #}
+    {# 3: C5 Smart #}
     <div class="staging-col">
-      <div class="staging-label" style="background:#C0392B;">D — Full Smart ✦</div>
+      <div class="staging-label" style="background:#2E7D5E;">C5 — Smart</div>
+      {% if sa.get('C5_SMART_FULL') %}
+      <img class="staging-img"
+           src="data:image/png;base64,{{ sa['C5_SMART_FULL'] }}"
+           alt="C5 Smart"/>
+      {% else %}
+      <div class="staging-placeholder">Non disponibile</div>
+      {% endif %}
+      {% if c5_esp.get('interventi_lista') %}
+      <div class="staging-card-body">
+        {% for iv in c5_esp['interventi_lista'] %}
+        <div class="staging-voce"><span>{{ iv.voce }}</span><span>€{{ iv.costo }}</span></div>
+        {% endfor %}
+        <div class="staging-total">€{{ c5_esp.get('costo_simulato', '—') }}</div>
+      </div>
+      {% endif %}
+    </div>
+
+    {# 4: D Layering ★ #}
+    <div class="staging-col">
+      <div class="staging-label badge-d">D — Layering ★</div>
       {% if sa.get('D_FULL_SMART') %}
       <img class="staging-img"
            src="data:image/png;base64,{{ sa['D_FULL_SMART'] }}"
-           alt="D Full Smart"/>
+           alt="D Layering"/>
       {% else %}
       <div class="staging-placeholder">Non disponibile</div>
       {% endif %}
       {% if d_esp.get('interventi_lista') %}
       <div class="staging-card-body">
         {% for iv in d_esp['interventi_lista'] %}
-        <div class="staging-voce">
-          <span>{{ iv.voce }}</span>
-          <span>€{{ iv.costo }}</span>
-        </div>
+        <div class="staging-voce"><span>{{ iv.voce }}</span><span>€{{ iv.costo }}</span></div>
         {% endfor %}
-        <div class="staging-total">Budget: €{{ d_esp.get('costo_simulato', '—') }}</div>
+        <div class="staging-total">€{{ d_esp.get('costo_simulato', '—') }}</div>
       </div>
       {% endif %}
     </div>
@@ -296,9 +312,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="int-row">
       <div>
         <span class="int-title">{{ iv.titolo }}</span>
-        <span class="int-badge" style="background:{{ priority_color(iv.priorita) }}">
-          {{ iv.priorita }}
-        </span>
+        <span class="int-badge" style="background:{{ priority_color(iv.priorita) }}">{{ iv.priorita }}</span>
       </div>
       <span class="int-cost">€{{ iv.costo_min }}–{{ iv.costo_max }}</span>
     </div>
@@ -317,19 +331,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <hr class="divider"/>
   {% set rc = analysis.riepilogo_costi %}
   <table class="cost-table">
-    <tr><td>Tinteggiatura professionale (manodopera + materiali)</td>
-        <td>€{{ rc.manodopera_tinteggiatura }}</td></tr>
-    <tr><td>Materiali pittura aggiuntivi</td>
-        <td>€{{ rc.materiali_pittura }}</td></tr>
-    <tr><td>Arredi e complementi</td>
-        <td>€{{ rc.arredi_complementi }}</td></tr>
-    <tr><td>Montaggio e varie</td>
-        <td>€{{ rc.montaggio_varie }}</td></tr>
-    <tr class="cost-total">
-        <td>Totale stimato</td><td>€{{ rc.totale }}</td></tr>
+    <tr><td>Tinteggiatura professionale (manodopera + materiali)</td><td>€{{ rc.manodopera_tinteggiatura }}</td></tr>
+    <tr><td>Materiali pittura aggiuntivi</td><td>€{{ rc.materiali_pittura }}</td></tr>
+    <tr><td>Arredi e complementi</td><td>€{{ rc.arredi_complementi }}</td></tr>
+    <tr><td>Montaggio e varie</td><td>€{{ rc.montaggio_varie }}</td></tr>
+    <tr class="cost-total"><td>Totale stimato</td><td>€{{ rc.totale }}</td></tr>
     {% if rc.budget_residuo and rc.budget_residuo > 0 %}
-    <tr class="residuo">
-        <td>Budget residuo disponibile</td><td>€{{ rc.budget_residuo }}</td></tr>
+    <tr class="residuo"><td>Budget residuo disponibile</td><td>€{{ rc.budget_residuo }}</td></tr>
     {% endif %}
   </table>
   {% if rc.nota_budget %}
@@ -380,19 +388,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 def generate_pdf(analysis: dict, prefs: dict, photos: list,
                 staged_results: list | None = None) -> bytes:
     """
-    Layout per stanza: 3 colonne — Originale | C4 Full | C5 Smart Full
-    """
-    for i, room in enumerate(analysis.get("stanze", [])):
-        idx = room.get("indice_foto", 0)
-        if idx < len(photos):
-            raw_bytes = compress_image(photos[idx]["content"], max_width=1400, quality=82)
-            room["original_photo_b64"]  = base64.b64encode(raw_bytes).decode()
-            room["original_photo_mime"] = "image/jpeg"
-        else:
-            room.setdefault("original_photo_b64", None)
-            room.setdefault("original_photo_mime", "image/jpeg")
+    Layout per stanza: 4 colonne — Originale | C4 Full | C5 Smart | D Layering ★
 
-        room["staged_approaches"] = (staged_results[i] or {}) if staged_results and i < len(staged_results) else {}
+    Fix multi-foto: indice_foto usa i (indice posizionale) come fallback, non 0.
+    """
+    stanze = analysis.get("stanze", [])
+    for i, room in enumerate(stanze):
+        # FIX MULTI-FOTO: fallback su i, non su 0
+        idx = room.get("indice_foto")
+        if idx is None or not isinstance(idx, int) or idx >= len(photos):
+            idx = i if i < len(photos) else 0
+            room["indice_foto"] = idx
+
+        raw_bytes = compress_image(photos[idx]["content"], max_width=1400, quality=82)
+        room["original_photo_b64"]  = base64.b64encode(raw_bytes).decode()
+        room["original_photo_mime"] = "image/jpeg"
+
+        room["staged_approaches"] = (
+            (staged_results[i] or {}) if staged_results and i < len(staged_results) else {}
+        )
         room["esperimenti_staged_map"] = {
             esp["logic_id"]: esp
             for esp in room.get("esperimenti_staged", [])
