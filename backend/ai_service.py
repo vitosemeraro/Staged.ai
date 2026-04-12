@@ -1,9 +1,10 @@
 """
-AI Service v13 — C4 + C5_SMART_FULL
-Layout PDF per ogni stanza:
-  - Foto originale
-  - C4_FULL (guidance=25, trasformazione totale con fedeltà geometrica)
-  - C5_SMART_FULL (guidance=28, decluttering + design attivo + lighting)
+AI Service v14 — C4 + C5_SMART_FULL
+Fix:
+  - Multi-foto: genera ESATTAMENTE N stanze, una per foto (con etichette sulle immagini)
+  - Inventario visivo obbligatorio (detected_elements) — no elementi allucinati
+  - Replacement logic per Imagen: "In place of [old], a [new IKEA] stands in the same spot"
+  - C5 guidance hardcodata >= 32 — pareti come elemento dominante
 """
 import asyncio
 import base64
@@ -144,6 +145,25 @@ def validate_and_fix_costs(analysis: dict, budget: int) -> dict:
     return analysis
 
 
+def _validate_stanze_count(analysis: dict, n_photos: int) -> dict:
+    """
+    Garantisce che ci siano esattamente n_photos stanze e che indice_foto
+    sia corretto (0..n_photos-1). Se Gemini ne ha restituite di meno, logga
+    un warning ma non blocca — il PDF mostrerà ciò che c'è.
+    """
+    stanze = analysis.get("stanze", [])
+    actual = len(stanze)
+    if actual != n_photos:
+        print(f"[WARNING] Gemini ha restituito {actual} stanze su {n_photos} foto attese.")
+    # Correzione di sicurezza: se indice_foto manca o è fuori range, usa l'indice posizionale
+    for i, room in enumerate(stanze):
+        idx = room.get("indice_foto")
+        if idx is None or not isinstance(idx, int) or idx >= n_photos:
+            print(f"[WARNING] stanza {i} ha indice_foto={idx!r}, corretto a {i}")
+            room["indice_foto"] = i
+    return analysis
+
+
 # ── GEMINI ANALYSIS ───────────────────────────────────────────────────────────
 
 async def analyze_with_gemini(photos: list, prefs: dict) -> dict:
@@ -153,6 +173,7 @@ async def analyze_with_gemini(photos: list, prefs: dict) -> dict:
         return _analysis_cache[key]
     loop   = asyncio.get_running_loop()
     result = await loop.run_in_executor(_gemini_executor, _gemini_sync, photos, prefs)
+    result = _validate_stanze_count(result, len(photos))
     result = validate_and_fix_costs(result, prefs["budget"])
     _analysis_cache[key] = result
     return result
@@ -164,6 +185,7 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
     location    = prefs["location"]
     destination = prefs["destination"]
     dest_label  = "Airbnb / affitto breve (STR)" if destination == "STR" else "Casa vacanza"
+    n           = len(photos)
 
     alloc = {
         "arredi":        int(budget * 0.40),
@@ -177,61 +199,91 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "Pensi come un architetto: elimini il superfluo, sostituisci con arredi iconici e accessibili "
         "(IKEA, H&M Home, Zara Home), ottimizzi luce e fotogenia per Airbnb. "
         "Conosci i prezzi reali di mercato delle principali citta' italiane. "
+        "REGOLA ASSOLUTA — INVENTARIO VISIVO: Prima di scrivere qualsiasi prompt_en, "
+        "devi fare un inventario letterale di cio' che vedi nella foto. "
+        "Non inventare elementi non visibili: se non vedi finestre, NON mettere tende. "
+        "Se non vedi un tavolo, NON rimuovere un tavolo. "
+        "Il campo detected_elements deve elencare SOLO cio' che e' fisicamente visibile nella foto. "
+        "I prompt_en devono essere costruiti ESCLUSIVAMENTE a partire da detected_elements. "
         "Rispondi ESCLUSIVAMENTE con un oggetto JSON valido. "
         "Nessun testo prima o dopo. Nessun markdown. Nessun backtick."
     )
 
+    # Costruzione della lista foto con indici espliciti nel testo
+    # così Gemini può abbinare ogni stanza alla foto giusta
+    foto_index_list = "\n".join(
+        f"  - FOTO {i}: indice_foto={i} — analizza questa foto e crea la stanza {i+1}"
+        for i in range(n)
+    )
+
     prompt = (
-        f"Analizza queste {len(photos)} foto e produci una scheda di home staging per {dest_label}.\n\n"
+        f"Analizza queste {n} foto e produci una scheda di home staging per {dest_label}.\n\n"
         f"PARAMETRI:\n"
         f"- Budget: \u20ac{budget} | Stile: {style} | Citta': {location} | Dest: {dest_label}\n\n"
         f"DISTRIBUZIONE BUDGET:\n"
         f"  Arredi \u20ac{alloc['arredi']} | Tinteggiatura \u20ac{alloc['tinteggiatura']} "
         f"| Materiali \u20ac{alloc['materiali']} | Montaggio \u20ac{alloc['montaggio']}\n\n"
         f"REGOLA MATEMATICA: SOMMA(costo_totale_stanza) <= {budget}.\n\n"
+        f"═══════════════════════════════════════════════════\n"
+        f"REGOLA MULTI-FOTO — CRITICA:\n"
+        f"Hai ricevuto {n} foto, etichettate nell'ordine:\n"
+        f"{foto_index_list}\n"
+        f"Devi generare ESATTAMENTE {n} oggetti nell'array 'stanze', uno per foto.\n"
+        f"indice_foto DEVE essere: 0 per la prima foto, 1 per la seconda, ... {n-1} per l'ultima.\n"
+        f"Non raggruppare foto diverse in una sola stanza. Non saltare foto.\n"
+        f"═══════════════════════════════════════════════════\n\n"
         f"REGOLA INTERVENTI — agisci da designer, non da consulente:\n"
         f"- Rimuovi ESPLICITAMENTE mobili brutti, ingombranti o inutili per affitti brevi.\n"
         f"- Sostituisci arredi datati con pezzi IKEA moderni se il budget lo permette.\n"
-        f"- Specifica sempre: texture parete (es. 'matte plaster white'), "
-        f"modello arredi (es. 'IKEA LISABO table'), tessili (colore+materiale).\n"
-        f"- Rimuovi elementi disturbanti: sacchi spazzatura, cavi, oggetti buttati.\n\n"
-        f"GENERA 2 varianti staged per ogni stanza:\n\n"
-        f"VARIANTE C4_FULL (guidance=25) — trasformazione totale coordinata:\n"
-        f"Prompt denso in inglese (max 70 parole). Include: new wall color+texture, "
-        f"all new furniture, textiles, lighting, decor. Coerente con stile {style}.\n\n"
-        f"VARIANTE C5_SMART_FULL (guidance=28) — design attivo con decluttering:\n"
-        f"Agisci da Interior Designer senior per Airbnb. Il prompt DEVE:\n"
-        f"1. Iniziare con: 'Clean, minimalist renovation of this room.'\n"
-        f"2. Dichiarare la rimozione esplicita: 'Remove all clutter, old bulky furniture, "
-        f"trash bags, messy cables, unnecessary objects.'\n"
-        f"3. Specificare pareti: 'freshly painted matte eggshell white finish' o colore {style}.\n"
-        f"4. Specificare solo arredi ESSENZIALI e fotogenici: max 3-4 pezzi IKEA-style con nome.\n"
-        f"5. Specificare luce: 'professional real estate photography, soft natural light "
-        f"from windows, bright and airy atmosphere, 8k resolution.'\n"
-        f"6. Specificare inquadratura: 'wide angle shot from corner to maximize perceived space.'\n\n"
-        f"Restituisci SOLO questo JSON:\n\n"
+        f"- Specifica sempre: texture parete, modello arredi (es. 'IKEA LISABO'), tessili.\n"
+        f"- Rimuovi elementi disturbanti: sacchi spazzatura, cavi, oggetti abbandonati.\n\n"
+        f"STEP 1 — INVENTARIO VISIVO (per ogni foto, obbligatorio):\n"
+        f"Compila detected_elements elencando SOLO cio' che vedi fisicamente in quella foto:\n"
+        f"es. ['red sofa', 'wooden floor', 'yellow walls', 'no windows visible', 'overhead lamp']\n"
+        f"CRITICO: se non vedi finestre scrivi 'no windows visible'. "
+        f"Se non vedi tende, NON inserire 'curtains' o 'drapes' nei prompt.\n\n"
+        f"STEP 2 — GENERA 2 varianti staged per ogni stanza BASATE SU detected_elements:\n\n"
+        f"VARIANTE C4_FULL (guidance=25) — trasformazione totale:\n"
+        f"Prompt in inglese (max 70 parole). "
+        f"Inizia con: 'The room features [New Color] walls covering all surfaces from floor to ceiling.' "
+        f"Poi usa replacement logic: 'In place of the [old item], a [new IKEA model] stands in the same position.' "
+        f"Include nuovi arredi, tessili, luci coerenti con stile {style}. "
+        f"NON inventare elementi non in detected_elements.\n\n"
+        f"VARIANTE C5_SMART_FULL (guidance=32) — decluttering + sostituzione precisa:\n"
+        f"REGOLE FERREE:\n"
+        f"1. INIZIA SEMPRE con: 'The room features freshly painted matte white walls "
+        f"covering all surfaces from floor to ceiling, replacing all previous colors and textures.'\n"
+        f"2. Per OGNI mobile in detected_elements usa: "
+        f"'In place of the [colore+tipo], a [modello IKEA esatto] stands in the same spot.'\n"
+        f"3. VIETATO 'curtains', 'drapes', 'blinds' se detected_elements ha 'no windows visible'.\n"
+        f"4. Includi SOLO sostituzioni dirette di elementi realmente visibili.\n"
+        f"5. Chiudi con: 'Professional real estate photography, soft natural light, "
+        f"bright and airy atmosphere, wide angle from corner, 8k resolution.'\n\n"
+        f"Restituisci SOLO questo JSON (con {n} oggetti nell'array 'stanze'):\n\n"
         "{{\n"
-        "  \"valutazione_generale\": \"analisi visiva dettagliata\",\n"
+        "  \"valutazione_generale\": \"analisi visiva complessiva di tutte le stanze\",\n"
         "  \"punti_di_forza\": [\"p1\", \"p2\"],\n"
-        "  \"criticita\": [\"c1 — descrizione specifica elemento da rimuovere/cambiare\"],\n"
+        "  \"criticita\": [\"c1 — elemento specifico da rimuovere/cambiare\"],\n"
         f"  \"potenziale_str\": \"potenziale {dest_label} a {location}\",\n"
         "  \"tariffe\": {{\n"
         "    \"attuale_notte\": \"\u20acXX-YY\",\n"
         "    \"post_restyling_notte\": \"\u20acXX-YY\",\n"
         "    \"incremento_percentuale\": \"XX%\"\n"
         "  }},\n"
-        "  \"stanze\": [\n"
+        f"  \"stanze\": [\n"
+        f"    /* RIPETI QUESTO BLOCCO {n} VOLTE, una per ogni foto (indice_foto: 0..{n-1}) */\n"
         "    {{\n"
-        "      \"nome\": \"Soggiorno\",\n"
+        "      \"nome\": \"Nome stanza identificata nella foto (es. Soggiorno, Camera, Cucina)\",\n"
         "      \"indice_foto\": 0,\n"
+        "      \"detected_elements\": [\"elemento1 visibile\", \"elemento2 visibile\", \"no windows visible se assenti\"],\n"
         "      \"stato_attuale\": \"descrizione dettagliata inclusi elementi da rimuovere\",\n"
         "      \"interventi\": [\n"
         "        {{\n"
         "          \"titolo\": \"nome intervento\",\n"
-        f"          \"dettaglio\": \"prodotto specifico, brand, prezzo {location}\",\n"
+        f"          \"dettaglio\": \"prodotto specifico, brand, prezzo a {location}\",\n"
         "          \"costo_min\": 50, \"costo_max\": 120,\n"
         "          \"priorita\": \"alta\",\n"
-        f"          \"dove_comprare\": \"negozio coerente con {style}\"\n"
+        f"          \"dove_comprare\": \"negozio coerente con stile {style}\"\n"
         "        }}\n"
         "      ],\n"
         "      \"costo_totale_stanza\": 350,\n"
@@ -239,25 +291,25 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "        {{\n"
         "          \"logic_id\": \"C4_FULL\",\n"
         "          \"guidance_scale\": 25,\n"
-        f"          \"prompt_en\": \"Full home staging transformation. [New wall color+texture]. [New main furniture pieces with exact names and colors, {style} style]. [New textiles: rug, curtains, cushions]. [Lighting]. Bright natural light. Professional interior photography. 4k.\",\n"
+        f"          \"prompt_en\": \"The room features [New Color] walls covering all surfaces from floor to ceiling. In place of the [old item from detected_elements], a [IKEA model] stands in the same position. [Other replacements]. {style} style. Professional interior photography. 4k.\",\n"
         "          \"interventi_lista\": [\n"
-        "            {{\"voce\": \"Pittura pareti colore specifico\", \"costo\": 300}},\n"
-        "            {{\"voce\": \"Arredo principale (es. divano IKEA)\", \"costo\": 400}},\n"
+        "            {{\"voce\": \"Pittura pareti — [colore specifico]\", \"costo\": 300}},\n"
+        "            {{\"voce\": \"Sostituzione [mobile] — IKEA [modello]\", \"costo\": 400}},\n"
         "            {{\"voce\": \"Tessili e decor coordinati\", \"costo\": 200}}\n"
         "          ],\n"
         "          \"costo_simulato\": 900\n"
         "        }},\n"
         "        {{\n"
         "          \"logic_id\": \"C5_SMART_FULL\",\n"
-        "          \"guidance_scale\": 28,\n"
-        "          \"prompt_en\": \"Clean, minimalist renovation of this room. Remove all clutter, old bulky furniture, trash bags, messy cables, unnecessary objects. Walls: freshly painted matte eggshell white. [3-4 essential IKEA-style pieces with exact model names]. [Key textiles]. Professional real estate photography, soft natural light from windows, bright and airy atmosphere, wide angle from corner, 8k resolution.\",\n"
+        "          \"guidance_scale\": 32,\n"
+        "          \"prompt_en\": \"The room features freshly painted matte white walls covering all surfaces from floor to ceiling, replacing all previous colors and textures. In place of the [colore+tipo da detected_elements], an IKEA [modello esatto] stands in the same spot. [Altri replacement da detected_elements]. Professional real estate photography, soft natural light, bright and airy atmosphere, wide angle from corner, 8k resolution.\",\n"
         "          \"interventi_lista\": [\n"
-        "            {{\"voce\": \"Rimozione mobili ingombranti\", \"costo\": 80}},\n"
-        "            {{\"voce\": \"Pittura pareti bianco opaco\", \"costo\": 300}},\n"
-        "            {{\"voce\": \"Arredo essenziale IKEA-style\", \"costo\": 450}},\n"
-        "            {{\"voce\": \"Ottimizzazione luce naturale\", \"costo\": 50}}\n"
+        "            {{\"voce\": \"Pittura pareti bianco opaco (elemento dominante)\", \"costo\": 350}},\n"
+        "            {{\"voce\": \"Sostituzione [mobile 1] — IKEA [modello]\", \"costo\": 450}},\n"
+        "            {{\"voce\": \"Sostituzione [mobile 2] — IKEA [modello]\", \"costo\": 80}},\n"
+        "            {{\"voce\": \"Tappeto e cuscini coordinati\", \"costo\": 100}}\n"
         "          ],\n"
-        "          \"costo_simulato\": 880\n"
+        "          \"costo_simulato\": 980\n"
         "        }}\n"
         "      ]\n"
         "    }}\n"
@@ -271,19 +323,24 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "  \"piano_acquisti\": [\n"
         "    {{\n"
         "      \"categoria\": \"Arredi\",\n"
-        f"      \"articoli\": [\"item specifico {style}\"],\n"
+        f"      \"articoli\": [\"item specifico stile {style}\"],\n"
         "      \"budget_stimato\": 0,\n"
-        f"      \"negozi_consigliati\": \"IKEA, H&M Home, {location}\"\n"
+        f"      \"negozi_consigliati\": \"IKEA, H&M Home, Zara Home — {location}\"\n"
         "    }}\n"
         "  ],\n"
-        "  \"titolo_annuncio_suggerito\": \"Titolo Airbnb max 50 car\",\n"
+        "  \"titolo_annuncio_suggerito\": \"Titolo Airbnb max 50 caratteri\",\n"
         "  \"highlights_str\": [\"h1\", \"h2\", \"h3\"],\n"
         "  \"roi_restyling\": \"ROI: \u20acX, +\u20acY/notte, break-even Z notti\"\n"
         "}}"
     )
 
+    # ── Costruzione parts: ogni foto è preceduta da un'etichetta testuale ──
+    # Questo permette a Gemini di abbinare esattamente ogni immagine al suo indice_foto
     parts = []
-    for p in photos:
+    for i, p in enumerate(photos):
+        parts.append({
+            "text": f"[FOTO {i} — indice_foto: {i} — analizza questa immagine per la stanza {i+1}]"
+        })
         parts.append({
             "inline_data": {
                 "mime_type": p["content_type"],
@@ -302,16 +359,18 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         }
     }
 
-    response = httpx.post(GEMINI_URL, json=payload, timeout=120.0,
+    response = httpx.post(GEMINI_URL, json=payload, timeout=180.0,
                           headers={"Content-Type": "application/json"})
     response.raise_for_status()
 
     data = response.json()
     text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    return _extract_json(text)
+    result = _extract_json(text)
+    print(f"[Gemini] stanze restituite: {len(result.get('stanze', []))} / {n} foto")
+    return result
 
 
-# ── STAGED PHOTOS — solo C4 e C5 ─────────────────────────────────────────────
+# ── STAGED PHOTOS — C4 e C5 ──────────────────────────────────────────────────
 # Output per ogni stanza: {"C4_FULL": "<b64>", "C5_SMART_FULL": "<b64>"}
 
 async def generate_staged_photos(photos: list, analysis: dict) -> list:
@@ -320,7 +379,7 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
     all_futures = []
 
     for i, room in enumerate(stanze):
-        idx         = room.get("indice_foto", 0)
+        idx         = room.get("indice_foto", i)
         esperimenti = room.get("esperimenti_staged", [])
         photo_bytes = photos[idx]["content"] if idx < len(photos) else None
 
@@ -361,10 +420,14 @@ def _approach_C_edit(photo_bytes: bytes, prompt: str,
                      guidance_scale: int, label: str) -> str | None:
     """
     edit_image EDIT_MODE_DEFAULT + RawReferenceImage.
-    C4: guidance=25, negative prompt standard (protegge geometria)
-    C5: guidance=28, negative prompt potenziato (rimuove clutter e mobili brutti)
+    C4: guidance=25, replacement logic, pareti come elemento dominante
+    C5: guidance >= 32 (hardcodato), matte white walls + replacement logic precisa per mobile
     """
     try:
+        # C5: forza guidance minimo 32 — il testo del prompt deve dominare sull'immagine
+        if label == "C5_SMART_FULL":
+            guidance_scale = max(guidance_scale, 32)
+
         compressed = compress_image(photo_bytes, max_width=1024, quality=80)
         print(f"[{label}] foto: {len(compressed)//1024}KB guidance={guidance_scale}")
 
@@ -377,14 +440,14 @@ def _approach_C_edit(photo_bytes: bytes, prompt: str,
             "watermark, low quality, unrealistic"
         )
 
-        # C5 aggiunge termini per forzare pulizia e rimozione clutter
+        # C5: negative prompt potenziato per forzare pulizia e cambio colore pareti
         if label == "C5_SMART_FULL":
             negative_prompt = (
                 negative_base + ", "
                 "clutter, trash bags, messy cables, old bulky furniture, "
-                "dark shadows, blurry background, yellowish tint, "
+                "dark shadows, blurry background, yellowish tint, original wall color retained, "
                 "dirty surfaces, crowded space, outdated appliances visible, "
-                "mismatched colors, cheap materials"
+                "mismatched colors, cheap materials, same walls as original"
             )
         else:
             negative_prompt = negative_base
