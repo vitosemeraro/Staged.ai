@@ -3,13 +3,9 @@ PDF Service — WeasyPrint + Jinja2
 Produces a multi-page A4 PDF with:
   - Cover page (metadata + tariffe)
   - Valutazione generale
-  - One page per room: ORIGINALE | C4 | C5 photos + interventi + costi
+  - One page per room: PRIMA / DOPO photos + interventi + costi
   - Riepilogo costi + Piano acquisti
   - Annuncio ottimizzato + ROI
-
-Fix v14:
-  - indice_foto fallback usa i (indice posizionale della stanza) invece di 0
-  - room counter "Stanza N di M" nel header
 """
 import base64
 from datetime import date
@@ -69,14 +65,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   /* ── Room pages ── */
   .room-page { page-break-before:always; padding:50px; }
-  .room-header { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:4px; }
+  .room-header { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:6px; }
   .room-name { font-family:'Playfair Display',serif; font-size:24pt; }
   .room-cost { font-size:14pt; font-weight:700; }
-  .room-counter { font-size:9pt; color:#aaa; text-transform:uppercase;
-                  letter-spacing:1.5px; margin-bottom:4px; }
   .room-status { font-size:10.5pt; color:#777; margin-bottom:18px; }
-
-  /* Layout 3 colonne: Originale | C4 | C5 */
+  .photos-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:26px; }
+  /* Layout C4/C5 */
   .staging-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-bottom:20px; }
   .staging-col { }
   .staging-label { font-size:7.5pt; text-transform:uppercase; letter-spacing:1.5px;
@@ -93,7 +87,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .staging-voce:last-child { border-bottom:none; }
   .staging-total { font-size:8pt; font-weight:700; color:#2c2c2a;
                    padding-top:4px; text-align:right; }
-
+  .photo-label { font-size:8pt; text-transform:uppercase; letter-spacing:1.5px;
+                 color:#888; margin-bottom:5px; }
+  .room-photo { width:100%; max-height:220px; object-fit:contain; background:#f5f5f3; border-radius:6px; display:block; }
+  .photo-placeholder { width:100%; height:185px; background:#f0eeea; border-radius:6px;
+                       display:flex; align-items:center; justify-content:center;
+                       font-size:9pt; color:#bbb; }
   .int-section-title { font-size:9pt; text-transform:uppercase; letter-spacing:1.5px;
                        color:#888; margin-bottom:10px; font-weight:700; }
   .intervention { border-left:3px solid #eee; padding:8px 0 8px 14px; margin-bottom:10px; }
@@ -151,7 +150,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="cover-sub">
       Scheda professionale per
       {{ 'affitto breve (Airbnb / Booking)' if prefs.destination == 'STR' else 'casa vacanza' }}
-      · {{ analysis.stanze | length }} stanz{{ 'a' if analysis.stanze | length == 1 else 'e' }} analizzat{{ 'a' if analysis.stanze | length == 1 else 'e' }}
     </div>
 
     <div class="cover-meta">
@@ -188,7 +186,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
     </div>
   </div>
-  <div class="footer-cover">Generato con Gemini 2.5 Flash · Imagen 3 · {{ today }}</div>
+  <div class="footer-cover">Generato con Gemini 1.5 Pro · Imagen 3 · {{ today }}</div>
 </div>
 
 {# ──────────────── VALUTAZIONE GENERALE ──────────────── #}
@@ -217,10 +215,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </div>
 
 {# ──────────────── ROOM PAGES ──────────────── #}
-{% set n_stanze = analysis.stanze | length %}
 {% for room in analysis.stanze %}
 <div class="room-page">
-  <div class="room-counter">Stanza {{ loop.index }} di {{ n_stanze }}</div>
   <div class="room-header">
     <div class="room-name">{{ room.nome }}</div>
     <div class="room-cost">€{{ room.costo_totale_stanza }}</div>
@@ -230,7 +226,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   {# ── 3 colonne: Originale | C4 Full | C5 Smart Full ── #}
   {% set sa = room.staged_approaches or {} %}
   {% set c4_esp = room.esperimenti_staged_map.get('C4_FULL', {}) %}
-  {% set c5_esp = room.esperimenti_staged_map.get('C5_SMART_FULL', {}) %}
+  {% set d_esp = room.esperimenti_staged_map.get('D_FULL_SMART', {}) %}
 
   <div class="staging-grid">
 
@@ -271,23 +267,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     {# Colonna 3: C5 Smart Full #}
     <div class="staging-col">
-      <div class="staging-label" style="background:#2E7D5E;">C5 — Smart Full ✦</div>
-      {% if sa.get('C5_SMART_FULL') %}
+      <div class="staging-label" style="background:#C0392B;">D — Full Smart ✦</div>
+      {% if sa.get('D_FULL_SMART') %}
       <img class="staging-img"
-           src="data:image/png;base64,{{ sa['C5_SMART_FULL'] }}"
-           alt="C5 Smart Full"/>
+           src="data:image/png;base64,{{ sa['D_FULL_SMART'] }}"
+           alt="D Full Smart"/>
       {% else %}
       <div class="staging-placeholder">Non disponibile</div>
       {% endif %}
-      {% if c5_esp.get('interventi_lista') %}
+      {% if d_esp.get('interventi_lista') %}
       <div class="staging-card-body">
-        {% for iv in c5_esp['interventi_lista'] %}
+        {% for iv in d_esp['interventi_lista'] %}
         <div class="staging-voce">
           <span>{{ iv.voce }}</span>
           <span>€{{ iv.costo }}</span>
         </div>
         {% endfor %}
-        <div class="staging-total">Budget: €{{ c5_esp.get('costo_simulato', '—') }}</div>
+        <div class="staging-total">Budget: €{{ d_esp.get('costo_simulato', '—') }}</div>
       </div>
       {% endif %}
     </div>
@@ -385,25 +381,18 @@ def generate_pdf(analysis: dict, prefs: dict, photos: list,
                 staged_results: list | None = None) -> bytes:
     """
     Layout per stanza: 3 colonne — Originale | C4 Full | C5 Smart Full
-
-    Fix: indice_foto usa `i` come fallback (non 0) per garantire che ogni stanza
-    mostri la propria foto originale quando ci sono più foto caricate.
     """
-    stanze = analysis.get("stanze", [])
-    for i, room in enumerate(stanze):
-        # FIX MULTI-FOTO: fallback su `i` (indice posizionale), non su 0
-        idx = room.get("indice_foto")
-        if idx is None or not isinstance(idx, int) or idx >= len(photos):
-            idx = i if i < len(photos) else 0
-            room["indice_foto"] = idx
+    for i, room in enumerate(analysis.get("stanze", [])):
+        idx = room.get("indice_foto", 0)
+        if idx < len(photos):
+            raw_bytes = compress_image(photos[idx]["content"], max_width=1400, quality=82)
+            room["original_photo_b64"]  = base64.b64encode(raw_bytes).decode()
+            room["original_photo_mime"] = "image/jpeg"
+        else:
+            room.setdefault("original_photo_b64", None)
+            room.setdefault("original_photo_mime", "image/jpeg")
 
-        raw_bytes = compress_image(photos[idx]["content"], max_width=1400, quality=82)
-        room["original_photo_b64"]  = base64.b64encode(raw_bytes).decode()
-        room["original_photo_mime"] = "image/jpeg"
-
-        room["staged_approaches"] = (
-            (staged_results[i] or {}) if staged_results and i < len(staged_results) else {}
-        )
+        room["staged_approaches"] = (staged_results[i] or {}) if staged_results and i < len(staged_results) else {}
         room["esperimenti_staged_map"] = {
             esp["logic_id"]: esp
             for esp in room.get("esperimenti_staged", [])
