@@ -1,12 +1,12 @@
 """
-PDF Service v17 — WeasyPrint + Jinja2
+PDF Service v18 — WeasyPrint + Jinja2
 
-Layout:
-  - Cover
-  - Valutazione generale + composit masonry PRIMA | DOPO (tutte le stanze)
-  - Una pagina per stanza: PRIMA | DOPO affiancate grandi + interventi
-  - Riepilogo costi + Piano acquisti
-  - Annuncio + ROI
+Fix v18:
+  - Composit PRIMA|DOPO su pagina dedicata, usa table layout (WeasyPrint
+    ha problemi con flex/grid per immagini — table è il layout più affidabile)
+  - Tutte le foto del composit alla stessa altezza fissa (180px, object-fit:cover)
+  - Foto di dettaglio stanza: stessa altezza fissa (260px, object-fit:cover)
+  - Rimosso il preventivo D sotto le foto di dettaglio (già presente nella lista interventi)
 """
 import base64
 from datetime import date
@@ -49,7 +49,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .incremento-box .tariffa-label { color:#aaa; }
   .footer-cover { font-size:8pt; color:#bbb; }
 
-  /* ── Sezione testo ── */
+  /* ── Valutazione generale ── */
   .section { page-break-before:always; padding:50px; }
   .section-title { font-family:'Playfair Display',serif; font-size:22pt; margin-bottom:6px; }
   .divider { border:none; border-top:2px solid #2c2c2a; margin:10px 0 22px; width:40px; }
@@ -63,64 +63,79 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .point.green::before { background:#639922; }
   .point.amber::before { background:#BA7517; }
 
-  /* ── Composit PRIMA | DOPO (valutazione generale) ── */
-  .composit-section { margin-top:30px; }
-  .composit-grid { display:grid; grid-template-columns:1fr 1fr; gap:0; }
-  .composit-col { }
-  .composit-header {
-    text-align:center; padding:10px 0; font-size:9pt; font-weight:900;
-    letter-spacing:4px; text-transform:uppercase;
-  }
-  .composit-header.prima { background:#2c2c2a; color:#fff; }
-  .composit-header.dopo  { background:#B8860B; color:#fff; }
-  .composit-photos { display:flex; flex-direction:column; gap:3px; padding:3px; background:#e8e6e0; }
-  .composit-photo { width:100%; display:block; object-fit:cover; }
+  /* ── Composit PRIMA | DOPO ──
+     Usa <table> perché WeasyPrint gestisce table-layout in modo più
+     affidabile di flex/grid quando ci sono immagini con dimensioni miste.
+     Ogni foto è in un <td> con overflow:hidden + altezza fissa.        ── */
+  .composit-page { page-break-before:always; padding:50px 50px 40px; }
+  .composit-title { font-family:'Playfair Display',serif; font-size:22pt; margin-bottom:6px; }
+  .composit-table { width:100%; border-collapse:collapse; margin-top:16px; }
+  .composit-table td { width:50%; vertical-align:top; padding:0; }
+  .composit-table td:first-child { padding-right:4px; }
+  .composit-table td:last-child  { padding-left:4px; }
 
-  /* ── Pagina stanza: PRIMA | DOPO ── */
+  /* Header PRIMA / DOPO sopra ogni colonna */
+  .col-hdr {
+    text-align:center; padding:10px 0; font-size:9pt; font-weight:900;
+    letter-spacing:4px; text-transform:uppercase; margin-bottom:4px;
+  }
+  .col-hdr.prima { background:#2c2c2a; color:#fff; }
+  .col-hdr.dopo  { background:#B8860B; color:#fff; }
+
+  /* Ogni foto del composit: altezza fissa, larghezza 100%, crop center */
+  .composit-row { margin-bottom:4px; overflow:hidden; }
+  .composit-img {
+    width:100%; height:180px;
+    object-fit:cover; object-position:center;
+    display:block;
+  }
+  .composit-ph {
+    width:100%; height:180px;
+    background:#f0eeea;
+    display:table-cell; vertical-align:middle;
+    text-align:center; font-size:9pt; color:#bbb;
+  }
+
+  /* ── Pagina stanza ── */
   .room-page { page-break-before:always; padding:44px 50px 36px; }
   .room-counter { font-size:9pt; color:#aaa; text-transform:uppercase;
                   letter-spacing:1.5px; margin-bottom:4px; }
-  .room-header { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:4px; }
+  .room-header { display:grid; grid-template-columns:1fr auto; align-items:baseline;
+                 margin-bottom:4px; }
   .room-name { font-family:'Playfair Display',serif; font-size:22pt; }
   .room-cost { font-size:13pt; font-weight:700; }
   .room-status { font-size:10pt; color:#777; margin-bottom:16px; }
 
-  /* Blocco PRIMA / DOPO affiancato */
-  .prima-dopo-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:22px; }
-  .pd-col { }
+  /* PRIMA | DOPO affiancate — stessa altezza fissa */
+  .pd-table { width:100%; border-collapse:collapse; margin-bottom:22px; }
+  .pd-table td { width:50%; vertical-align:top; padding:0; }
+  .pd-table td:first-child { padding-right:5px; }
+  .pd-table td:last-child  { padding-left:5px; }
+
   .pd-label {
-    text-align:center; padding:7px 0; font-size:8pt; font-weight:900;
+    text-align:center; padding:8px 0; font-size:8pt; font-weight:900;
     letter-spacing:3px; text-transform:uppercase;
     border-radius:4px 4px 0 0;
   }
   .pd-label.prima { background:#2c2c2a; color:#fff; }
   .pd-label.dopo  { background:#B8860B; color:#fff; }
-  .pd-img {
-    width:100%; display:block; object-fit:cover;
-    border-radius:0 0 4px 4px;
-    border:1px solid #e0ddd8; border-top:none;
-  }
-  .pd-placeholder {
-    width:100%; height:200px; background:#f0eeea;
-    display:flex; align-items:center; justify-content:center;
-    font-size:9pt; color:#bbb;
-    border:1px solid #e0ddd8; border-top:none;
-    border-radius:0 0 4px 4px;
-  }
 
-  /* ── Preventivo D sotto le foto ── */
-  .d-budget-strip {
-    display:flex; flex-wrap:wrap; gap:6px; margin-bottom:18px;
-    padding:10px 12px; background:#fafaf8; border:1px solid #ede9e2;
-    border-radius:6px;
+  /* Altezza fissa per entrambe le foto → stessa riga visiva */
+  .pd-img {
+    width:100%; height:260px;
+    object-fit:cover; object-position:center;
+    display:block;
+    border:1px solid #e0ddd8; border-top:none;
+    border-radius:0 0 4px 4px;
   }
-  .d-voce { font-size:9pt; color:#555; flex:1; min-width:160px;
-            display:flex; justify-content:space-between; gap:8px; }
-  .d-voce-label { }
-  .d-voce-cost { font-weight:700; white-space:nowrap; }
-  .d-total { font-size:10pt; font-weight:700; color:#2c2c2a;
-             border-top:1px solid #ddd; padding-top:6px; margin-top:4px;
-             width:100%; text-align:right; }
+  .pd-ph {
+    width:100%; height:260px;
+    background:#f0eeea;
+    display:table-cell; vertical-align:middle;
+    text-align:center; font-size:9pt; color:#bbb;
+    border:1px solid #e0ddd8; border-top:none;
+    border-radius:0 0 4px 4px;
+  }
 
   /* ── Interventi ── */
   .int-section-title { font-size:9pt; text-transform:uppercase; letter-spacing:1.5px;
@@ -216,7 +231,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="footer-cover">Generato con Gemini 2.5 Flash · Imagen 3 · {{ today }}</div>
 </div>
 
-{# ── VALUTAZIONE GENERALE + COMPOSIT ── #}
+{# ── VALUTAZIONE GENERALE (testo + punti) ── #}
 <div class="section">
   <div class="section-title">Valutazione generale</div>
   <hr class="divider"/>
@@ -224,7 +239,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   {% if analysis.potenziale_str %}
   <p class="body-text">{{ analysis.potenziale_str }}</p>
   {% endif %}
-
   <div class="two-col">
     <div>
       <div class="col-title">Punti di forza</div>
@@ -239,46 +253,51 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       {% endfor %}
     </div>
   </div>
+</div>
 
-  {# Composit masonry: tutte le PRIMA a sinistra, tutte le DOPO a destra #}
-  {% if analysis.stanze | length > 0 %}
-  <div class="composit-section">
-    <div class="composit-grid">
-      <div class="composit-col">
-        <div class="composit-header prima">Prima</div>
-        <div class="composit-photos">
-          {% for room in analysis.stanze %}
+{# ── COMPOSIT PRIMA | DOPO — pagina dedicata ── #}
+<div class="composit-page">
+  <div class="composit-title">Tutte le stanze — Prima &amp; Dopo</div>
+  <hr class="divider"/>
+
+  {# Due colonne via table: PRIMA sinistra, DOPO destra.
+     Le foto di ogni stanza sono impilate nella stessa cella,
+     una per riga, con altezza fissa identica.                #}
+  <table class="composit-table">
+    <tr>
+      <td>
+        <div class="col-hdr prima">Prima</div>
+        {% for room in analysis.stanze %}
+        <div class="composit-row">
           {% if room.original_photo_b64 %}
-          <img class="composit-photo"
+          <img class="composit-img"
                src="data:{{ room.original_photo_mime }};base64,{{ room.original_photo_b64 }}"
                alt="Prima — {{ room.nome }}"/>
+          {% else %}
+          <div class="composit-ph">{{ room.nome }} — non disponibile</div>
           {% endif %}
-          {% endfor %}
         </div>
-      </div>
-      <div class="composit-col">
-        <div class="composit-header dopo">Dopo</div>
-        <div class="composit-photos">
-          {% for room in analysis.stanze %}
+        {% endfor %}
+      </td>
+      <td>
+        <div class="col-hdr dopo">Dopo</div>
+        {% for room in analysis.stanze %}
+        <div class="composit-row">
           {% if room.staged_d_b64 %}
-          <img class="composit-photo"
+          <img class="composit-img"
                src="data:image/jpeg;base64,{{ room.staged_d_b64 }}"
                alt="Dopo — {{ room.nome }}"/>
           {% else %}
-          <div style="background:#f0eeea;height:160px;display:flex;align-items:center;
-                      justify-content:center;font-size:9pt;color:#bbb;">
-            Elaborazione non disponibile
-          </div>
+          <div class="composit-ph">{{ room.nome }} — elaborazione non disponibile</div>
           {% endif %}
-          {% endfor %}
         </div>
-      </div>
-    </div>
-  </div>
-  {% endif %}
+        {% endfor %}
+      </td>
+    </tr>
+  </table>
 </div>
 
-{# ── PAGINE STANZA: PRIMA | DOPO ── #}
+{# ── PAGINE STANZA ── #}
 {% set n_stanze = analysis.stanze | length %}
 {% for room in analysis.stanze %}
 <div class="room-page">
@@ -289,46 +308,33 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
   <p class="room-status">{{ room.stato_attuale }}</p>
 
-  {# PRIMA | DOPO affiancate, grandi #}
-  <div class="prima-dopo-grid">
-    <div class="pd-col">
-      <div class="pd-label prima">Prima</div>
-      {% if room.original_photo_b64 %}
-      <img class="pd-img"
-           src="data:{{ room.original_photo_mime }};base64,{{ room.original_photo_b64 }}"
-           alt="Prima"/>
-      {% else %}
-      <div class="pd-placeholder">Non disponibile</div>
-      {% endif %}
-    </div>
-    <div class="pd-col">
-      <div class="pd-label dopo">Dopo</div>
-      {% if room.staged_d_b64 %}
-      <img class="pd-img"
-           src="data:image/jpeg;base64,{{ room.staged_d_b64 }}"
-           alt="Dopo — D Layering"/>
-      {% else %}
-      <div class="pd-placeholder">Non disponibile</div>
-      {% endif %}
-    </div>
-  </div>
+  {# PRIMA | DOPO — stessa altezza fissa via table #}
+  <table class="pd-table">
+    <tr>
+      <td>
+        <div class="pd-label prima">Prima</div>
+        {% if room.original_photo_b64 %}
+        <img class="pd-img"
+             src="data:{{ room.original_photo_mime }};base64,{{ room.original_photo_b64 }}"
+             alt="Prima"/>
+        {% else %}
+        <div class="pd-ph">Non disponibile</div>
+        {% endif %}
+      </td>
+      <td>
+        <div class="pd-label dopo">Dopo</div>
+        {% if room.staged_d_b64 %}
+        <img class="pd-img"
+             src="data:image/jpeg;base64,{{ room.staged_d_b64 }}"
+             alt="Dopo"/>
+        {% else %}
+        <div class="pd-ph">Non disponibile</div>
+        {% endif %}
+      </td>
+    </tr>
+  </table>
 
-  {# Budget D sotto le foto #}
-  {% if room.d_interventi_lista %}
-  <div class="d-budget-strip">
-    {% for iv in room.d_interventi_lista %}
-    <div class="d-voce">
-      <span class="d-voce-label">{{ iv.voce }}</span>
-      <span class="d-voce-cost">€{{ iv.costo }}</span>
-    </div>
-    {% endfor %}
-    {% if room.d_costo_simulato %}
-    <div class="d-total">Budget stimato: €{{ room.d_costo_simulato }}</div>
-    {% endif %}
-  </div>
-  {% endif %}
-
-  {# Interventi #}
+  {# Solo interventi — niente budget D duplicato #}
   <div class="int-section-title">Interventi</div>
   {% for iv in room.interventi %}
   <div class="intervention" style="border-left-color:{{ priority_color(iv.priorita) }}">
@@ -411,10 +417,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 def generate_pdf(analysis: dict, prefs: dict, photos: list,
                 staged_results: list | None = None) -> bytes:
     """
-    Layout v17:
-      - Composit masonry PRIMA | DOPO nella valutazione generale
-      - Per ogni stanza: solo PRIMA | DOPO affiancate grandi
-      - Nessuna colonna C4/C5
+    v18: composit su pagina dedicata con table layout, foto stessa altezza.
+    Niente budget strip nelle pagine di dettaglio.
     """
     stanze = analysis.get("stanze", [])
     for i, room in enumerate(stanze):
@@ -433,15 +437,6 @@ def generate_pdf(analysis: dict, prefs: dict, photos: list,
         if staged_results and i < len(staged_results):
             d_b64 = (staged_results[i] or {}).get("D_FULL_SMART")
         room["staged_d_b64"] = d_b64
-
-        # Budget D dalla mappa esperimenti
-        d_esp = next(
-            (e for e in room.get("esperimenti_staged", [])
-             if e.get("logic_id") == "D_FULL_SMART"),
-            {}
-        )
-        room["d_interventi_lista"] = d_esp.get("interventi_lista", [])
-        room["d_costo_simulato"]   = d_esp.get("costo_simulato")
 
     html_str = Template(HTML_TEMPLATE).render(
         analysis=analysis,
