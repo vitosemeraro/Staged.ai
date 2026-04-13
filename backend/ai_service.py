@@ -1,17 +1,21 @@
 """
-AI Service v15.1 — C4 + C5_SMART_FULL + D_FULL_SMART
-Tre varianti staged per stanza:
-  - C4_FULL       (guidance=25): trasformazione totale, replacement logic mobili
-  - C5_SMART_FULL (guidance=28): pareti bianche dominanti + sostituzione precisa
-  - D_FULL_SMART  (guidance=28): LAYERING — veste la stanza, aggiunge tessili/
-                                  piante/quadri/luci, qualità cinematografica
+AI Service v16 — C4 + C5_SMART_FULL + D_FULL_SMART (two-stage)
 
-FIX v15.1:
-  - guidance_scale D abbassato a 28 (Imagen 3 EDIT_MODE_DEFAULT: max ~30,
-    valori > 30 restituiscono silenziosamente 0 immagini)
-  - C5 abbassato da 32 a 28 per la stessa ragione
-  - Logging errori migliorato: stampa il traceback completo per D
-  - Multi-foto, inventario visivo, replacement logic: invariati
+Implementa le raccomandazioni Gemini:
+  1. Guidance scale abbassato: D usa 10 (range 8-12), non 28-35
+  2. Chain-of-Thought visual analysis: Gemini mappa sorgente luce + materiali
+     prima di scrivere i prompt, inietta consistent shadows / global illumination
+  3. Keyword fotorealismo nei prompt: depth of field f/8, ray tracing, HDR,
+     soft shadows matching window light, realistic fabric folds, ambient occlusion
+  4. Negative prompt potenziato: flat lighting, floating objects, sticker effect
+  5. D two-stage workflow: Stage 1 pulisce la stanza, Stage 2 la arreda
+     (risolve il collo di bottiglia "rimuovi E ricostruisci" in un colpo solo)
+
+Fix ereditati v14-v15:
+  - Multi-foto: N stanze con etichette sulle immagini
+  - Inventario visivo obbligatorio (detected_elements)
+  - Replacement logic per Imagen
+  - Fallback indice_foto posizionale
 """
 import asyncio
 import base64
@@ -47,13 +51,15 @@ GEMINI_URL = (
     f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
 )
 
-# ── Guidance scale limits per variante ───────────────────────────────────────
-# Imagen 3 EDIT_MODE_DEFAULT restituisce 0 immagini (silenziosamente) con
-# guidance_scale > ~30. Usiamo 28 come massimo sicuro per C5 e D.
+# ── Guidance scale per variante ───────────────────────────────────────────────
+# Fonte: raccomandazione Gemini — guidance alta crea "effetto collage"
+# Range sicuro EDIT_MODE_DEFAULT: 1–30 (>30 = 0 immagini silenzioso)
+# D two-stage: Stage1 (clean) usa 8, Stage2 (stage) usa 10
 GUIDANCE = {
-    "C4_FULL":       25,   # trasformazione totale
-    "C5_SMART_FULL": 28,   # pareti bianche dominanti
-    "D_FULL_SMART":  28,   # layering — stesso livello, prompt diverso
+    "C4_FULL":          25,   # trasformazione totale fedele
+    "C5_SMART_FULL":    22,   # pareti bianche, meno rigido
+    "D_STAGE1_CLEAN":    8,   # pulizia stanza — massima libertà creativa
+    "D_STAGE2_STAGE":   10,   # arredo su stanza pulita
 }
 
 _vertex_client = None
@@ -61,7 +67,7 @@ _vertex_client = None
 def _get_vertex_client():
     global _vertex_client
     if _vertex_client is None:
-        print(f"[Imagen] init Vertex AI client project={PROJECT_ID} location={LOCATION}")
+        print(f"[Imagen] init client project={PROJECT_ID} location={LOCATION}")
         _vertex_client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
     return _vertex_client
 
@@ -166,11 +172,10 @@ def _validate_stanze_count(analysis: dict, n_photos: int) -> dict:
     stanze = analysis.get("stanze", [])
     actual = len(stanze)
     if actual != n_photos:
-        print(f"[WARNING] Gemini ha restituito {actual} stanze su {n_photos} foto attese.")
+        print(f"[WARNING] Gemini ha restituito {actual} stanze su {n_photos} attese.")
     for i, room in enumerate(stanze):
         idx = room.get("indice_foto")
         if idx is None or not isinstance(idx, int) or idx >= n_photos:
-            print(f"[WARNING] stanza {i} ha indice_foto={idx!r}, corretto a {i}")
             room["indice_foto"] = i
     return analysis
 
@@ -206,14 +211,16 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
     }
 
     system_instruction = (
-        "Sei un Interior Designer senior italiano specializzato in home staging per affitti brevi. "
-        "Pensi come un fotografo di interni e un set designer: non solo sostituisci mobili, "
-        "ma 'vesti' le stanze con tessili, oggetti, luci e piante per creare atmosfera fotografica. "
-        "Conosci IKEA, H&M Home, Zara Home, Westwing, e sai costruire layering di stile economico. "
-        "REGOLA ASSOLUTA — INVENTARIO VISIVO: Prima di scrivere qualsiasi prompt_en, "
-        "fai un inventario di cio' che vedi fisicamente nella foto. "
-        "Non inventare elementi non visibili: se non vedi finestre, NON mettere tende. "
-        "Il campo detected_elements elenca SOLO cio' che e' fisicamente visibile. "
+        "Sei un Interior Designer senior e fotografo di interni specializzato in home staging per affitti brevi. "
+        "Prima di generare qualsiasi prompt Imagen, esegui una MAPPATURA SPAZIALE della foto: "
+        "1) Identifica la posizione della sorgente luminosa principale (es. 'finestra a destra a 45 gradi'). "
+        "2) Identifica i materiali esistenti (pavimento, pareti, soffitto). "
+        "3) Stima la direzione delle ombre portate. "
+        "Questa analisi va nel campo 'light_analysis' e DEVE essere usata per costruire i prompt_en: "
+        "ogni prompt deve includere 'consistent shadows', 'global illumination', 'ambient occlusion' "
+        "per evitare l'effetto sticker/collage sugli oggetti aggiunti. "
+        "REGOLA INVENTARIO VISIVO: il campo detected_elements elenca SOLO cio' che e' fisicamente visibile. "
+        "Se non vedi finestre, scrivi 'no windows visible' e NON inserire tende nei prompt. "
         "Rispondi ESCLUSIVAMENTE con un oggetto JSON valido, senza markdown ne' backtick."
     )
 
@@ -229,44 +236,57 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         f"  Arredi \u20ac{alloc['arredi']} | Tinteggiatura \u20ac{alloc['tinteggiatura']} "
         f"| Materiali \u20ac{alloc['materiali']} | Montaggio \u20ac{alloc['montaggio']}\n\n"
         f"REGOLA MATEMATICA: SOMMA(costo_totale_stanza) <= {budget}.\n\n"
-        f"REGOLA MULTI-FOTO — CRITICA:\n"
+        f"REGOLA MULTI-FOTO:\n"
         f"{foto_index_list}\n"
         f"Genera ESATTAMENTE {n} oggetti in 'stanze', uno per foto.\n"
-        f"indice_foto: 0 per la prima, 1 per la seconda, ... {n - 1} per l'ultima.\n"
         f"Non raggruppare foto diverse. Non saltare foto.\n\n"
-        f"STEP 1 — INVENTARIO VISIVO per ogni foto:\n"
-        f"Compila detected_elements con SOLO gli elementi fisicamente visibili.\n"
-        f"Se non vedi finestre scrivi 'no windows visible'.\n\n"
-        f"STEP 2 — GENERA 3 VARIANTI per ogni stanza:\n\n"
-        f"VARIANTE C4_FULL (guidance=25) — Trasformazione totale:\n"
-        f"Inizia: 'The room features [New Color] walls covering all surfaces from floor to ceiling.'\n"
-        f"Usa replacement logic: 'In place of the [old item], a [new IKEA model] stands in the same position.'\n"
-        f"NON inventare elementi assenti da detected_elements.\n\n"
-        f"VARIANTE C5_SMART_FULL (guidance=28) — Pareti bianche dominanti:\n"
-        f"INIZIA SEMPRE: 'The room features freshly painted matte white walls covering all surfaces "
-        f"from floor to ceiling, replacing all previous colors and textures.'\n"
-        f"Per ogni mobile in detected_elements: "
-        f"'In place of the [colore+tipo], a [modello IKEA esatto] stands in the same spot.'\n"
-        f"VIETATO curtains/drapes se 'no windows visible' in detected_elements.\n\n"
-        f"VARIANTE D_FULL_SMART (guidance=28) — LAYERING: vesti la stanza, non stravolgerla:\n"
-        f"FILOSOFIA D: AGGIUNGERE strati di stile su cio' che c'e'.\n"
-        f"REGOLE FERREE:\n"
-        f"1. ARREDO: mantieni i mobili funzionali. Aggiungi cuscini colorati e tappeto.\n"
-        f"2. PARETI: applica finitura materica coerente con {style} "
-        f"(stucco veneziano grigio, calce bianca, carta da parati). "
-        f"NON lasciare pareti originali.\n"
-        f"3. LAYERING — aggiungi tutti questi:\n"
-        f"   - Tappeto design davanti al divano\n"
-        f"   - 3-5 cuscini decorativi misti sul divano\n"
-        f"   - 1-2 piante grandi (Monstera, Ficus) in vasi terracotta\n"
-        f"   - Mensola metallo nero con luci Edison e oggetti deco\n"
-        f"   - 2 quadri/stampe in cornici nere\n"
-        f"   - Lampada a stelo per luce calda\n"
-        f"4. Il prompt_en DEVE finire con: 'professional real estate photography, "
-        f"24mm wide angle lens, cinematic warm lighting, balanced exposure, "
-        f"perfectly staged interior, highly detailed, 8k.'\n"
-        f"5. NO curtains/drapes se 'no windows visible' in detected_elements.\n\n"
-        f"Restituisci SOLO questo JSON (con {n} oggetti in 'stanze'):\n\n"
+
+        f"═══ STEP 1 — ANALISI VISIVA E LUCE (per ogni foto) ═══\n"
+        f"Compila per ogni stanza:\n"
+        f"  detected_elements: lista oggetti fisicamente visibili\n"
+        f"  light_analysis: posizione sorgente luce (es. 'finestra sinistra, luce naturale diffusa'),\n"
+        f"    materiali esistenti (es. 'pavimento parquet chiaro, pareti gialle opache'),\n"
+        f"    direzione ombre portate (es. 'ombre verso destra e sul pavimento')\n\n"
+
+        f"═══ STEP 2 — 3 VARIANTI STAGED ═══\n\n"
+
+        f"C4_FULL (guidance=25) — Trasformazione totale:\n"
+        f"  Inizia: 'The room features [New Color] walls covering all surfaces from floor to ceiling.'\n"
+        f"  Usa replacement logic: 'In place of the [old item], a [new IKEA model] stands in the same position.'\n"
+        f"  Inietta dalla light_analysis: 'soft shadows falling [direzione] consistent with [sorgente]'\n"
+        f"  Chiudi con: 'global illumination, ambient occlusion, depth of field f/8, HDR, 8k.'\n\n"
+
+        f"C5_SMART_FULL (guidance=22) — Pareti bianche + sostituzione precisa:\n"
+        f"  Inizia: 'The room features freshly painted matte white walls covering all surfaces.'\n"
+        f"  Replacement logic per ogni mobile in detected_elements.\n"
+        f"  Inietta light coerenza: 'soft shadows matching [sorgente da light_analysis]'\n"
+        f"  Chiudi con: 'consistent shadows, global illumination, ambient occlusion, ray tracing, 8k.'\n\n"
+
+        f"D_FULL_SMART — TWO-STAGE (guidance Stage1=8, Stage2=10):\n"
+        f"FILOSOFIA: workflow a due stadi per evitare il collo di bottiglia\n"
+        f"  'rimuovi E ricostruisci contemporaneamente'.\n"
+        f"  Stage 1 (pulisci): rimuovi tutto il superfluo, lascia struttura pulita.\n"
+        f"  Stage 2 (arreda): aggiungi layering ricco sulla stanza pulita.\n\n"
+
+        f"  PROMPT_STAGE1 (pulizia):\n"
+        f"  Inizia: 'Empty, clean room. Remove all existing furniture, objects, clutter.'\n"
+        f"  Mantieni: pareti (con nuova finitura materica {style}), pavimento originale, soffitto.\n"
+        f"  Specifica finitura pareti coerente con {style}.\n"
+        f"  Chiudi con: 'photorealistic, consistent lighting, 8k.'\n\n"
+
+        f"  PROMPT_STAGE2 (arredo layering):\n"
+        f"  Inizia descrivendo la stanza vuota con la nuova finitura dal Stage1.\n"
+        f"  Aggiungi elementi in ordine spaziale (dal basso): pavimento → sedute → illuminazione → deco.\n"
+        f"  Usa light_analysis per ombreggiature: 'shadows fall [direzione], soft shadows from [sorgente]'\n"
+        f"  LAYERING OBBLIGATORIO: tappeto, 3-5 cuscini texture misti, pianta grande in vaso terracotta,\n"
+        f"    mensola metallo nero con luci Edison, 2 stampe in cornici nere, lampada a stelo.\n"
+        f"  Keyword fotorealismo OBBLIGATORIE: 'realistic fabric folds', 'reflections on polished surfaces',\n"
+        f"    'soft shadows matching window light', 'consistent shadows', 'global illumination',\n"
+        f"    'ambient occlusion', 'depth of field f/8', 'ray tracing', 'HDR'\n"
+        f"  Chiudi con: 'professional real estate photography, 24mm wide angle lens, cinematic warm lighting,\n"
+        f"    balanced exposure, perfectly staged interior, highly detailed, 8k.'\n\n"
+
+        f"Restituisci SOLO questo JSON ({n} oggetti in 'stanze'):\n\n"
         "{{\n"
         "  \"valutazione_generale\": \"analisi visiva complessiva\",\n"
         "  \"punti_di_forza\": [\"p1\", \"p2\"],\n"
@@ -280,10 +300,15 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         f"  \"stanze\": [\n"
         f"    /* RIPETI {n} VOLTE — indice_foto 0..{n - 1} */\n"
         "    {{\n"
-        "      \"nome\": \"Nome stanza (es. Soggiorno, Camera, Cucina)\",\n"
+        "      \"nome\": \"Nome stanza\",\n"
         "      \"indice_foto\": 0,\n"
-        "      \"detected_elements\": [\"red sofa\", \"wooden floor\", \"yellow walls\", \"no windows visible\"],\n"
-        "      \"stato_attuale\": \"descrizione dettagliata inclusi elementi da rimuovere\",\n"
+        "      \"detected_elements\": [\"elemento visibile 1\", \"no windows visible se assenti\"],\n"
+        "      \"light_analysis\": {{\n"
+        "        \"light_source\": \"es. finestra sinistra, luce naturale diffusa\",\n"
+        "        \"existing_materials\": \"es. parquet chiaro, pareti gialle opache, soffitto bianco\",\n"
+        "        \"shadow_direction\": \"es. ombre verso destra sul pavimento\"\n"
+        "      }},\n"
+        "      \"stato_attuale\": \"descrizione dettagliata\",\n"
         "      \"interventi\": [\n"
         "        {{\n"
         "          \"titolo\": \"nome intervento\",\n"
@@ -298,7 +323,7 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "        {{\n"
         "          \"logic_id\": \"C4_FULL\",\n"
         "          \"guidance_scale\": 25,\n"
-        f"          \"prompt_en\": \"The room features [New Color] walls covering all surfaces from floor to ceiling. In place of the [old item], a [IKEA model] stands in the same position. {style} style. Professional interior photography. 4k.\",\n"
+        f"          \"prompt_en\": \"The room features [color] walls. In place of [old item], a [IKEA model] stands in same position. Shadows fall [direzione da light_analysis] consistent with [sorgente]. Global illumination, ambient occlusion, depth of field f/8, HDR, {style} style, 8k.\",\n"
         "          \"interventi_lista\": [\n"
         "            {{\"voce\": \"Pittura pareti [colore]\", \"costo\": 300}},\n"
         "            {{\"voce\": \"Sostituzione [mobile] — IKEA [modello]\", \"costo\": 400}},\n"
@@ -308,8 +333,8 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "        }},\n"
         "        {{\n"
         "          \"logic_id\": \"C5_SMART_FULL\",\n"
-        "          \"guidance_scale\": 28,\n"
-        "          \"prompt_en\": \"The room features freshly painted matte white walls covering all surfaces from floor to ceiling, replacing all previous colors and textures. In place of the [colore+tipo], an IKEA [modello esatto] stands in the same spot. Professional real estate photography, wide angle from corner, 8k resolution.\",\n"
+        "          \"guidance_scale\": 22,\n"
+        "          \"prompt_en\": \"The room features freshly painted matte white walls covering all surfaces from floor to ceiling, replacing all previous colors and textures. In place of [old item], an IKEA [exact model] stands in same spot. Soft shadows matching [sorgente da light_analysis]. Consistent shadows, global illumination, ambient occlusion, ray tracing, 8k.\",\n"
         "          \"interventi_lista\": [\n"
         "            {{\"voce\": \"Pittura pareti bianco opaco\", \"costo\": 350}},\n"
         "            {{\"voce\": \"Sostituzione [mobile] — IKEA [modello]\", \"costo\": 450}},\n"
@@ -319,12 +344,14 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "        }},\n"
         "        {{\n"
         "          \"logic_id\": \"D_FULL_SMART\",\n"
-        "          \"guidance_scale\": 28,\n"
-        "          \"prompt_en\": \"[prompt specifico per QUESTA stanza basato su detected_elements: mantieni il mobile principale, applica finitura pareti materica, aggiungi layering tessili/piante/quadri/luci]. Professional real estate photography, 24mm wide angle lens, cinematic warm lighting, balanced exposure, perfectly staged interior, highly detailed, 8k.\",\n"
+        "          \"guidance_scale_stage1\": 8,\n"
+        "          \"guidance_scale_stage2\": 10,\n"
+        "          \"prompt_stage1\": \"Empty, clean room. Remove all existing furniture, objects and clutter. Keep the structure: [finitura pareti materica coerente con style, es. venetian plaster warm grey], [pavimento da detected_elements]. Photorealistic, consistent lighting matching [sorgente da light_analysis], 8k.\",\n"
+        f"          \"prompt_stage2\": \"[Descrivi stanza vuota con nuova finitura]. Add: [tappeto design] on [pavimento]. Keep [mobile principale se funzionale] dressed with [3-4 cuscini texture misti]. Add: [mensola metallo nero con 3 luci Edison]. Hang: [2 stampe cornici nere]. Add corner: [Monstera in vaso terracotta]. Add: [lampada a stelo metallo nero]. Realistic fabric folds, reflections on polished surfaces, soft shadows matching [sorgente], consistent shadows, global illumination, ambient occlusion, depth of field f/8, ray tracing, HDR. Professional real estate photography, 24mm wide angle lens, cinematic warm lighting, balanced exposure, highly detailed, 8k.\",\n"
         "          \"interventi_lista\": [\n"
         "            {{\"voce\": \"Finitura pareti materica [tipo]\", \"costo\": 400}},\n"
         "            {{\"voce\": \"Tappeto design — H&M Home / Westwing\", \"costo\": 120}},\n"
-        "            {{\"voce\": \"Cuscini decorativi 5 pz — Zara Home\", \"costo\": 80}},\n"
+        "            {{\"voce\": \"Cuscini 5 pz — Zara Home\", \"costo\": 80}},\n"
         "            {{\"voce\": \"Mensola metallo nero + luci Edison\", \"costo\": 90}},\n"
         "            {{\"voce\": \"2 stampe + cornici nere IKEA FISKBO\", \"costo\": 40}},\n"
         "            {{\"voce\": \"Pianta Monstera + vaso terracotta\", \"costo\": 45}},\n"
@@ -355,10 +382,11 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "}}"
     )
 
+    # Etichetta testuale prima di ogni foto
     parts = []
     for i, p in enumerate(photos):
         parts.append({
-            "text": f"[FOTO {i} — indice_foto: {i} — analizza questa immagine per la stanza {i + 1}]"
+            "text": f"[FOTO {i} — indice_foto: {i} — stanza {i + 1}]"
         })
         parts.append({
             "inline_data": {
@@ -389,7 +417,7 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
     return result
 
 
-# ── STAGED PHOTOS — C4, C5, D ────────────────────────────────────────────────
+# ── STAGED PHOTOS ─────────────────────────────────────────────────────────────
 
 async def generate_staged_photos(photos: list, analysis: dict) -> list:
     stanze = analysis.get("stanze", [])
@@ -403,20 +431,33 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
 
         for esp in esperimenti:
             logic_id = esp.get("logic_id", "")
-            if logic_id not in ("C4_FULL", "C5_SMART_FULL", "D_FULL_SMART"):
-                continue
-            prompt   = esp.get("prompt_en", "")
-            # Override guidance con i valori hardcodati sicuri
-            guidance = GUIDANCE.get(logic_id, 25)
-            if not prompt or not photo_bytes:
-                continue
 
-            all_futures.append((logic_id, i,
-                loop.run_in_executor(
-                    _imagen_executor, _approach_C_edit,
-                    photo_bytes, prompt, guidance, logic_id
-                )
-            ))
+            if logic_id == "D_FULL_SMART":
+                # Two-stage: passa entrambi i prompt e i guidance separati
+                p1 = esp.get("prompt_stage1", "")
+                p2 = esp.get("prompt_stage2", "")
+                g1 = esp.get("guidance_scale_stage1", GUIDANCE["D_STAGE1_CLEAN"])
+                g2 = esp.get("guidance_scale_stage2", GUIDANCE["D_STAGE2_STAGE"])
+                if not p1 or not p2 or not photo_bytes:
+                    continue
+                all_futures.append(("D_FULL_SMART", i,
+                    loop.run_in_executor(
+                        _imagen_executor, _approach_D_two_stage,
+                        photo_bytes, p1, p2, g1, g2
+                    )
+                ))
+
+            elif logic_id in ("C4_FULL", "C5_SMART_FULL"):
+                prompt   = esp.get("prompt_en", "")
+                guidance = GUIDANCE.get(logic_id, 25)
+                if not prompt or not photo_bytes:
+                    continue
+                all_futures.append((logic_id, i,
+                    loop.run_in_executor(
+                        _imagen_executor, _approach_single,
+                        photo_bytes, prompt, guidance, logic_id
+                    )
+                ))
 
     results = [{} for _ in stanze]
     gathered = await asyncio.gather(
@@ -425,7 +466,7 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
     )
     for (key, room_idx, _), result in zip(all_futures, gathered):
         if isinstance(result, Exception):
-            print(f"[{key} stanza {room_idx}] ERRORE: {result}")
+            print(f"[{key} stanza {room_idx}] ERRORE: {result}\n{traceback.format_exc()}")
             results[room_idx][key] = None
         else:
             results[room_idx][key] = result
@@ -433,51 +474,32 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
     return results
 
 
-# ── Core edit function ────────────────────────────────────────────────────────
+# ── Core: singola chiamata Imagen (C4, C5) ────────────────────────────────────
 
-def _approach_C_edit(photo_bytes: bytes, prompt: str,
-                     guidance_scale: int, label: str) -> str | None:
-    """
-    edit_image EDIT_MODE_DEFAULT + RawReferenceImage.
-
-    IMPORTANTE — range guidance_scale per EDIT_MODE_DEFAULT:
-      Valori > ~30 restituiscono 0 immagini silenziosamente.
-      Massimo sicuro testato: 28.
-
-    C4_FULL       (25): replacement logic
-    C5_SMART_FULL (28): pareti bianche dominanti
-    D_FULL_SMART  (28): layering, stesso guidance ma prompt radicalmente diverso
-    """
+def _approach_single(photo_bytes: bytes, prompt: str,
+                     guidance: int, label: str) -> str | None:
     try:
         compressed = compress_image(photo_bytes, max_width=1024, quality=80)
-        print(f"[{label}] foto: {len(compressed)//1024}KB  guidance={guidance_scale}")
+        print(f"[{label}] foto: {len(compressed)//1024}KB  guidance={guidance}")
 
         client = _get_vertex_client()
 
+        # Negative prompt base — protegge geometria
         negative_base = (
-            "distorted architecture, blurry textures, changing window frame positions, "
+            "distorted architecture, blurry textures, changing window positions, "
             "moving doors, wrong room proportions, deformed walls, different ceiling height, "
-            "watermark, low quality, unrealistic"
+            "watermark, low quality, unrealistic, flat lighting, cartoon, illustration, "
+            "floating objects, sticker effect, inconsistent shadows, bad lighting"
         )
 
         if label == "C5_SMART_FULL":
-            negative_prompt = (
+            negative = (
                 negative_base + ", "
-                "clutter, trash bags, messy cables, old bulky furniture, "
-                "dark shadows, blurry background, yellowish tint, "
-                "original wall color retained, dirty surfaces, crowded space, "
-                "mismatched colors, same walls as original"
-            )
-        elif label == "D_FULL_SMART":
-            negative_prompt = (
-                negative_base + ", "
-                "empty room, bare walls, clutter, trash bags, messy cables, "
-                "dark shadows, bad exposure, overexposed, underexposed, harsh lighting, "
-                "noise, grainy, unwelcoming atmosphere, cheap furniture, bad framing, "
-                "overcrowded, cartoon style, illustration"
+                "clutter, trash bags, old bulky furniture, yellowish tint, "
+                "original wall color retained, dirty surfaces, same walls as original"
             )
         else:
-            negative_prompt = negative_base
+            negative = negative_base
 
         response = client.models.edit_image(
             model="imagen-3.0-capability-001",
@@ -491,8 +513,8 @@ def _approach_C_edit(photo_bytes: bytes, prompt: str,
             config=genai_types.EditImageConfig(
                 edit_mode="EDIT_MODE_DEFAULT",
                 number_of_images=1,
-                guidance_scale=float(guidance_scale),
-                negative_prompt=negative_prompt,
+                guidance_scale=float(guidance),
+                negative_prompt=negative,
                 safety_filter_level="block_only_high",
             ),
         )
@@ -503,11 +525,99 @@ def _approach_C_edit(photo_bytes: bytes, prompt: str,
                 response.generated_images[0].image.image_bytes
             ).decode()
 
-        # Nessuna immagine — logga l'intera risposta per diagnostica
-        print(f"[{label}] WARNING: 0 immagini restituite. "
+        print(f"[{label}] 0 immagini (guidance={guidance}). "
               f"generated_images={response.generated_images!r}")
         return None
 
     except Exception as e:
         print(f"[{label}] ERRORE: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        return None
+
+
+# ── Core: two-stage D ─────────────────────────────────────────────────────────
+
+def _approach_D_two_stage(photo_bytes: bytes,
+                           prompt_stage1: str, prompt_stage2: str,
+                           guidance1: int, guidance2: int) -> str | None:
+    """
+    Stage 1: pulisce la stanza (guidance basso = massima libertà di rimozione)
+    Stage 2: arreda la stanza pulita con layering ricco e keyword fotorealismo
+    """
+    try:
+        # ── Stage 1: Clean ────────────────────────────────────────────────────
+        compressed = compress_image(photo_bytes, max_width=1024, quality=80)
+        print(f"[D Stage1 Clean] {len(compressed)//1024}KB  guidance={guidance1}")
+
+        client = _get_vertex_client()
+
+        negative_clean = (
+            "furniture, objects, clutter, trash bags, messy cables, "
+            "distorted architecture, watermark, low quality, unrealistic"
+        )
+
+        r1 = client.models.edit_image(
+            model="imagen-3.0-capability-001",
+            prompt=prompt_stage1,
+            reference_images=[
+                genai_types.RawReferenceImage(
+                    reference_id=1,
+                    reference_image=genai_types.Image(image_bytes=compressed),
+                )
+            ],
+            config=genai_types.EditImageConfig(
+                edit_mode="EDIT_MODE_DEFAULT",
+                number_of_images=1,
+                guidance_scale=float(guidance1),
+                negative_prompt=negative_clean,
+                safety_filter_level="block_only_high",
+            ),
+        )
+
+        if not r1.generated_images:
+            print(f"[D Stage1] 0 immagini. Fallback su foto originale per Stage2.")
+            stage1_bytes = compress_image(photo_bytes, max_width=1024, quality=80)
+        else:
+            print(f"[D Stage1] SUCCESS → passo a Stage2")
+            stage1_bytes = r1.generated_images[0].image.image_bytes
+
+        # ── Stage 2: Stage ────────────────────────────────────────────────────
+        print(f"[D Stage2 Stage]  guidance={guidance2}")
+
+        negative_stage = (
+            "empty room, bare walls, clutter, trash bags, messy cables, "
+            "dark shadows, bad exposure, overexposed, underexposed, harsh lighting, "
+            "noise, grainy, unwelcoming atmosphere, bad framing, overcrowded, "
+            "cartoon style, flat lighting, floating objects, sticker effect, "
+            "inconsistent shadows, distorted architecture, watermark, low quality"
+        )
+
+        r2 = client.models.edit_image(
+            model="imagen-3.0-capability-001",
+            prompt=prompt_stage2,
+            reference_images=[
+                genai_types.RawReferenceImage(
+                    reference_id=1,
+                    reference_image=genai_types.Image(image_bytes=stage1_bytes),
+                )
+            ],
+            config=genai_types.EditImageConfig(
+                edit_mode="EDIT_MODE_DEFAULT",
+                number_of_images=1,
+                guidance_scale=float(guidance2),
+                negative_prompt=negative_stage,
+                safety_filter_level="block_only_high",
+            ),
+        )
+
+        if r2.generated_images:
+            print(f"[D Stage2] SUCCESS")
+            return base64.b64encode(
+                r2.generated_images[0].image.image_bytes
+            ).decode()
+
+        print(f"[D Stage2] 0 immagini (guidance={guidance2}).")
+        return None
+
+    except Exception as e:
+        print(f"[D two-stage] ERRORE: {type(e).__name__}: {e}\n{traceback.format_exc()}")
         return None
