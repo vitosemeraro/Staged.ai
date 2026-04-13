@@ -1,11 +1,12 @@
 """
-PDF Service — WeasyPrint + Jinja2 v15
-Layout per stanza: 4 colonne — Originale | C4 Full | C5 Smart | D Layering ★
+PDF Service v17 — WeasyPrint + Jinja2
 
-Fix:
-  - indice_foto fallback su i (non 0) per multi-foto
-  - 4° colonna D_FULL_SMART con badge dorato
-  - Counter "Stanza N di M"
+Layout:
+  - Cover
+  - Valutazione generale + composit masonry PRIMA | DOPO (tutte le stanze)
+  - Una pagina per stanza: PRIMA | DOPO affiancate grandi + interventi
+  - Riepilogo costi + Piano acquisti
+  - Annuncio + ROI
 """
 import base64
 from datetime import date
@@ -19,36 +20,36 @@ PRIORITY_COLOR = {
     "bassa": "#639922",
 }
 
-HTML_TEMPLATE = """<!DOCTYPE html>
+HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="it">
 <head>
 <meta charset="UTF-8"/>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&family=Playfair+Display:wght@700&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700;900&family=Playfair+Display:wght@700&display=swap');
   * { margin:0; padding:0; box-sizing:border-box; }
   body { font-family:'Lato',sans-serif; color:#2c2c2a; font-size:11pt; line-height:1.6; }
 
   /* ── Cover ── */
   .cover { page-break-after:always; padding:60px 50px; min-height:297mm;
            display:flex; flex-direction:column; justify-content:space-between; }
-  .brand  { font-size:9pt; letter-spacing:3px; text-transform:uppercase; color:#888; }
+  .brand { font-size:9pt; letter-spacing:3px; text-transform:uppercase; color:#888; }
   .cover-title { font-family:'Playfair Display',serif; font-size:32pt; font-weight:700;
                  margin:40px 0 12px; line-height:1.1; }
-  .cover-sub   { font-size:13pt; color:#555; margin-bottom:36px; }
-  .cover-meta  { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:36px; }
-  .meta-box    { border:1px solid #ddd; padding:14px 18px; border-radius:6px; }
-  .meta-label  { font-size:8pt; text-transform:uppercase; letter-spacing:1.5px; color:#888; margin-bottom:4px; }
-  .meta-value  { font-size:14pt; font-weight:700; }
+  .cover-sub { font-size:13pt; color:#555; margin-bottom:36px; }
+  .cover-meta { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:36px; }
+  .meta-box { border:1px solid #ddd; padding:14px 18px; border-radius:6px; }
+  .meta-label { font-size:8pt; text-transform:uppercase; letter-spacing:1.5px; color:#888; margin-bottom:4px; }
+  .meta-value { font-size:14pt; font-weight:700; }
   .tariffe-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin:24px 0; }
-  .tariffa-box  { background:#f5f5f3; padding:16px; border-radius:6px; text-align:center; }
-  .tariffa-num  { font-size:18pt; font-weight:700; color:#2c2c2a; }
+  .tariffa-box { background:#f5f5f3; padding:16px; border-radius:6px; text-align:center; }
+  .tariffa-num { font-size:18pt; font-weight:700; color:#2c2c2a; }
   .tariffa-label { font-size:8pt; color:#888; text-transform:uppercase; margin-top:4px; }
   .incremento-box { background:#2c2c2a; }
-  .incremento-box .tariffa-num   { color:#fff; }
+  .incremento-box .tariffa-num { color:#fff; }
   .incremento-box .tariffa-label { color:#aaa; }
   .footer-cover { font-size:8pt; color:#bbb; }
 
-  /* ── General section ── */
+  /* ── Sezione testo ── */
   .section { page-break-before:always; padding:50px; }
   .section-title { font-family:'Playfair Display',serif; font-size:22pt; margin-bottom:6px; }
   .divider { border:none; border-top:2px solid #2c2c2a; margin:10px 0 22px; width:40px; }
@@ -56,57 +57,84 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .two-col { display:grid; grid-template-columns:1fr 1fr; gap:24px; margin:20px 0; }
   .col-title { font-size:9pt; text-transform:uppercase; letter-spacing:1.5px;
                color:#888; margin-bottom:10px; font-weight:700; }
-  .point { font-size:10pt; color:#444; margin-bottom:6px;
-           padding-left:16px; position:relative; }
+  .point { font-size:10pt; color:#444; margin-bottom:6px; padding-left:16px; position:relative; }
   .point::before { content:''; position:absolute; left:0; top:7px;
                    width:6px; height:6px; border-radius:50%; }
-  .point.green::before  { background:#639922; }
-  .point.amber::before  { background:#BA7517; }
+  .point.green::before { background:#639922; }
+  .point.amber::before { background:#BA7517; }
 
-  /* ── Room pages ── */
-  .room-page { page-break-before:always; padding:40px 50px; }
+  /* ── Composit PRIMA | DOPO (valutazione generale) ── */
+  .composit-section { margin-top:30px; }
+  .composit-grid { display:grid; grid-template-columns:1fr 1fr; gap:0; }
+  .composit-col { }
+  .composit-header {
+    text-align:center; padding:10px 0; font-size:9pt; font-weight:900;
+    letter-spacing:4px; text-transform:uppercase;
+  }
+  .composit-header.prima { background:#2c2c2a; color:#fff; }
+  .composit-header.dopo  { background:#B8860B; color:#fff; }
+  .composit-photos { display:flex; flex-direction:column; gap:3px; padding:3px; background:#e8e6e0; }
+  .composit-photo { width:100%; display:block; object-fit:cover; }
+
+  /* ── Pagina stanza: PRIMA | DOPO ── */
+  .room-page { page-break-before:always; padding:44px 50px 36px; }
   .room-counter { font-size:9pt; color:#aaa; text-transform:uppercase;
                   letter-spacing:1.5px; margin-bottom:4px; }
   .room-header { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:4px; }
   .room-name { font-family:'Playfair Display',serif; font-size:22pt; }
   .room-cost { font-size:13pt; font-weight:700; }
-  .room-status { font-size:10pt; color:#777; margin-bottom:14px; }
+  .room-status { font-size:10pt; color:#777; margin-bottom:16px; }
 
-  /* ── 4 colonne: Originale | C4 | C5 | D ── */
-  .staging-grid { display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:8px; margin-bottom:16px; }
-  .staging-col { }
-  .staging-label { font-size:6.5pt; text-transform:uppercase; letter-spacing:1px;
-                   color:#fff; font-weight:700; padding:3px 6px; border-radius:4px 4px 0 0;
-                   white-space:nowrap; overflow:hidden; }
-  .staging-img { width:100%; height:130px; object-fit:cover; background:#f0eeea;
-                 display:block; border:1px solid #e8e8e8; border-top:none; }
-  .staging-placeholder { width:100%; height:130px; background:#f0eeea; display:flex;
-                          align-items:center; justify-content:center; font-size:7pt; color:#ccc;
-                          border:1px solid #e8e8e8; border-top:none; }
-  .staging-card-body { padding:4px 6px; border:1px solid #e8e8e8; border-top:none;
-                        border-radius:0 0 4px 4px; background:#fafaf9; }
-  .staging-voce { font-size:6.5pt; color:#555; padding:1px 0; display:flex;
-                  justify-content:space-between; border-bottom:1px solid #f0f0f0; }
-  .staging-voce:last-child { border-bottom:none; }
-  .staging-total { font-size:7pt; font-weight:700; color:#2c2c2a;
-                   padding-top:3px; text-align:right; }
+  /* Blocco PRIMA / DOPO affiancato */
+  .prima-dopo-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:22px; }
+  .pd-col { }
+  .pd-label {
+    text-align:center; padding:7px 0; font-size:8pt; font-weight:900;
+    letter-spacing:3px; text-transform:uppercase;
+    border-radius:4px 4px 0 0;
+  }
+  .pd-label.prima { background:#2c2c2a; color:#fff; }
+  .pd-label.dopo  { background:#B8860B; color:#fff; }
+  .pd-img {
+    width:100%; display:block; object-fit:cover;
+    border-radius:0 0 4px 4px;
+    border:1px solid #e0ddd8; border-top:none;
+  }
+  .pd-placeholder {
+    width:100%; height:200px; background:#f0eeea;
+    display:flex; align-items:center; justify-content:center;
+    font-size:9pt; color:#bbb;
+    border:1px solid #e0ddd8; border-top:none;
+    border-radius:0 0 4px 4px;
+  }
 
-  /* Badge D dorato */
-  .badge-d { background: linear-gradient(135deg, #B8860B, #DAA520); }
+  /* ── Preventivo D sotto le foto ── */
+  .d-budget-strip {
+    display:flex; flex-wrap:wrap; gap:6px; margin-bottom:18px;
+    padding:10px 12px; background:#fafaf8; border:1px solid #ede9e2;
+    border-radius:6px;
+  }
+  .d-voce { font-size:9pt; color:#555; flex:1; min-width:160px;
+            display:flex; justify-content:space-between; gap:8px; }
+  .d-voce-label { }
+  .d-voce-cost { font-weight:700; white-space:nowrap; }
+  .d-total { font-size:10pt; font-weight:700; color:#2c2c2a;
+             border-top:1px solid #ddd; padding-top:6px; margin-top:4px;
+             width:100%; text-align:right; }
 
   /* ── Interventi ── */
   .int-section-title { font-size:9pt; text-transform:uppercase; letter-spacing:1.5px;
                        color:#888; margin-bottom:8px; font-weight:700; }
   .intervention { border-left:3px solid #eee; padding:6px 0 6px 12px; margin-bottom:8px; }
-  .int-row   { display:flex; justify-content:space-between; align-items:flex-start; }
+  .int-row { display:flex; justify-content:space-between; align-items:flex-start; }
   .int-title { font-weight:700; font-size:10pt; }
   .int-badge { font-size:7pt; padding:2px 7px; border-radius:3px;
                color:#fff; font-weight:700; margin-left:7px; }
-  .int-cost  { font-size:10pt; font-weight:700; white-space:nowrap; margin-left:10px; }
+  .int-cost { font-size:10pt; font-weight:700; white-space:nowrap; margin-left:10px; }
   .int-detail { font-size:9.5pt; color:#555; margin-top:2px; line-height:1.5; }
-  .int-where  { font-size:8.5pt; color:#aaa; margin-top:2px; }
+  .int-where { font-size:8.5pt; color:#aaa; margin-top:2px; }
 
-  /* ── Costs summary ── */
+  /* ── Riepilogo costi ── */
   .costs-section { page-break-before:always; padding:50px; }
   .cost-table { width:100%; border-collapse:collapse; margin:18px 0; font-size:10.5pt; }
   .cost-table td { padding:9px 0; border-bottom:1px solid #eee; }
@@ -118,29 +146,31 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .shopping-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:18px 0; }
   .shop-card { border:1px solid #eee; border-radius:6px; padding:12px 14px; }
   .shop-header { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:4px; }
-  .shop-cat    { font-size:9pt; text-transform:uppercase; letter-spacing:1.5px; color:#888; font-weight:700; }
+  .shop-cat { font-size:9pt; text-transform:uppercase; letter-spacing:1.5px; color:#888; font-weight:700; }
   .shop-budget { font-size:11pt; font-weight:700; }
-  .shop-store  { font-size:9pt; color:#aaa; margin-bottom:6px; }
-  .shop-item   { font-size:9.5pt; color:#555; padding-left:10px; position:relative; margin-top:3px; }
+  .shop-store { font-size:9pt; color:#aaa; margin-bottom:6px; }
+  .shop-item { font-size:9.5pt; color:#555; padding-left:10px; position:relative; margin-top:3px; }
   .shop-item::before { content:'–'; position:absolute; left:0; color:#ccc; }
 
-  /* ── Listing page ── */
+  /* ── Listing ── */
   .listing-section { page-break-before:always; padding:50px; }
-  .listing-title-box { background:#2c2c2a; color:#fff; padding:20px 24px; border-radius:8px; margin:18px 0; }
+  .listing-title-box { background:#2c2c2a; color:#fff; padding:20px 24px;
+                       border-radius:8px; margin:18px 0; }
   .listing-title-text { font-family:'Playfair Display',serif; font-size:17pt; }
   .highlights { display:flex; flex-wrap:wrap; gap:8px; margin:16px 0; }
-  .highlight  { background:#f0eeea; padding:5px 12px; border-radius:3px; font-size:9.5pt; color:#555; }
+  .highlight { background:#f0eeea; padding:5px 12px; border-radius:3px;
+               font-size:9.5pt; color:#555; }
   .roi-box { border-left:4px solid #639922; padding:12px 16px; background:#f7fbf2;
-             border-radius:0 6px 6px 0; margin-top:20px; font-size:10.5pt; color:#3B6D11; line-height:1.7; }
+             border-radius:0 6px 6px 0; margin-top:20px; font-size:10.5pt;
+             color:#3B6D11; line-height:1.7; }
 
-  /* ── Page numbers ── */
   @page { size:A4; margin:0;
     @bottom-center { content:counter(page); font-size:8pt; color:#ccc; margin-bottom:18px; } }
 </style>
 </head>
 <body>
 
-{# ──────────────── COVER ──────────────── #}
+{# ── COVER ── #}
 <div class="cover">
   <div>
     <div class="brand">Home Staging Report · AI-Powered</div>
@@ -150,7 +180,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       {{ 'affitto breve (Airbnb / Booking)' if prefs.destination == 'STR' else 'casa vacanza' }}
       · {{ analysis.stanze | length }} stanz{{ 'a' if analysis.stanze | length == 1 else 'e' }} analizzat{{ 'a' if analysis.stanze | length == 1 else 'e' }}
     </div>
-
     <div class="cover-meta">
       <div class="meta-box">
         <div class="meta-label">Città</div>
@@ -169,7 +198,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="meta-value">{{ today }}</div>
       </div>
     </div>
-
     <div class="tariffe-grid">
       <div class="tariffa-box">
         <div class="tariffa-num">{{ analysis.tariffe.attuale_notte }}</div>
@@ -188,7 +216,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="footer-cover">Generato con Gemini 2.5 Flash · Imagen 3 · {{ today }}</div>
 </div>
 
-{# ──────────────── VALUTAZIONE GENERALE ──────────────── #}
+{# ── VALUTAZIONE GENERALE + COMPOSIT ── #}
 <div class="section">
   <div class="section-title">Valutazione generale</div>
   <hr class="divider"/>
@@ -211,9 +239,46 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       {% endfor %}
     </div>
   </div>
+
+  {# Composit masonry: tutte le PRIMA a sinistra, tutte le DOPO a destra #}
+  {% if analysis.stanze | length > 0 %}
+  <div class="composit-section">
+    <div class="composit-grid">
+      <div class="composit-col">
+        <div class="composit-header prima">Prima</div>
+        <div class="composit-photos">
+          {% for room in analysis.stanze %}
+          {% if room.original_photo_b64 %}
+          <img class="composit-photo"
+               src="data:{{ room.original_photo_mime }};base64,{{ room.original_photo_b64 }}"
+               alt="Prima — {{ room.nome }}"/>
+          {% endif %}
+          {% endfor %}
+        </div>
+      </div>
+      <div class="composit-col">
+        <div class="composit-header dopo">Dopo</div>
+        <div class="composit-photos">
+          {% for room in analysis.stanze %}
+          {% if room.staged_d_b64 %}
+          <img class="composit-photo"
+               src="data:image/jpeg;base64,{{ room.staged_d_b64 }}"
+               alt="Dopo — {{ room.nome }}"/>
+          {% else %}
+          <div style="background:#f0eeea;height:160px;display:flex;align-items:center;
+                      justify-content:center;font-size:9pt;color:#bbb;">
+            Elaborazione non disponibile
+          </div>
+          {% endif %}
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+  </div>
+  {% endif %}
 </div>
 
-{# ──────────────── ROOM PAGES ──────────────── #}
+{# ── PAGINE STANZA: PRIMA | DOPO ── #}
 {% set n_stanze = analysis.stanze | length %}
 {% for room in analysis.stanze %}
 <div class="room-page">
@@ -224,88 +289,46 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
   <p class="room-status">{{ room.stato_attuale }}</p>
 
-  {% set sa   = room.staged_approaches or {} %}
-  {% set c4_esp = room.esperimenti_staged_map.get('C4_FULL', {}) %}
-  {% set c5_esp = room.esperimenti_staged_map.get('C5_SMART_FULL', {}) %}
-  {% set d_esp  = room.esperimenti_staged_map.get('D_FULL_SMART', {}) %}
-
-  {# ── 4 colonne ── #}
-  <div class="staging-grid">
-
-    {# 1: Originale #}
-    <div class="staging-col">
-      <div class="staging-label" style="background:#555;">Originale</div>
+  {# PRIMA | DOPO affiancate, grandi #}
+  <div class="prima-dopo-grid">
+    <div class="pd-col">
+      <div class="pd-label prima">Prima</div>
       {% if room.original_photo_b64 %}
-      <img class="staging-img"
+      <img class="pd-img"
            src="data:{{ room.original_photo_mime }};base64,{{ room.original_photo_b64 }}"
-           alt="Originale"/>
+           alt="Prima"/>
       {% else %}
-      <div class="staging-placeholder">Non disponibile</div>
+      <div class="pd-placeholder">Non disponibile</div>
       {% endif %}
     </div>
-
-    {# 2: C4 Full #}
-    <div class="staging-col">
-      <div class="staging-label" style="background:#8B5E9C;">C4 — Full</div>
-      {% if sa.get('C4_FULL') %}
-      <img class="staging-img"
-           src="data:image/png;base64,{{ sa['C4_FULL'] }}"
-           alt="C4 Full"/>
+    <div class="pd-col">
+      <div class="pd-label dopo">Dopo</div>
+      {% if room.staged_d_b64 %}
+      <img class="pd-img"
+           src="data:image/jpeg;base64,{{ room.staged_d_b64 }}"
+           alt="Dopo — D Layering"/>
       {% else %}
-      <div class="staging-placeholder">Non disponibile</div>
-      {% endif %}
-      {% if c4_esp.get('interventi_lista') %}
-      <div class="staging-card-body">
-        {% for iv in c4_esp['interventi_lista'] %}
-        <div class="staging-voce"><span>{{ iv.voce }}</span><span>€{{ iv.costo }}</span></div>
-        {% endfor %}
-        <div class="staging-total">€{{ c4_esp.get('costo_simulato', '—') }}</div>
-      </div>
+      <div class="pd-placeholder">Non disponibile</div>
       {% endif %}
     </div>
-
-    {# 3: C5 Smart #}
-    <div class="staging-col">
-      <div class="staging-label" style="background:#2E7D5E;">C5 — Smart</div>
-      {% if sa.get('C5_SMART_FULL') %}
-      <img class="staging-img"
-           src="data:image/png;base64,{{ sa['C5_SMART_FULL'] }}"
-           alt="C5 Smart"/>
-      {% else %}
-      <div class="staging-placeholder">Non disponibile</div>
-      {% endif %}
-      {% if c5_esp.get('interventi_lista') %}
-      <div class="staging-card-body">
-        {% for iv in c5_esp['interventi_lista'] %}
-        <div class="staging-voce"><span>{{ iv.voce }}</span><span>€{{ iv.costo }}</span></div>
-        {% endfor %}
-        <div class="staging-total">€{{ c5_esp.get('costo_simulato', '—') }}</div>
-      </div>
-      {% endif %}
-    </div>
-
-    {# 4: D Layering ★ #}
-    <div class="staging-col">
-      <div class="staging-label badge-d">D — Layering ★</div>
-      {% if sa.get('D_FULL_SMART') %}
-      <img class="staging-img"
-           src="data:image/png;base64,{{ sa['D_FULL_SMART'] }}"
-           alt="D Layering"/>
-      {% else %}
-      <div class="staging-placeholder">Non disponibile</div>
-      {% endif %}
-      {% if d_esp.get('interventi_lista') %}
-      <div class="staging-card-body">
-        {% for iv in d_esp['interventi_lista'] %}
-        <div class="staging-voce"><span>{{ iv.voce }}</span><span>€{{ iv.costo }}</span></div>
-        {% endfor %}
-        <div class="staging-total">€{{ d_esp.get('costo_simulato', '—') }}</div>
-      </div>
-      {% endif %}
-    </div>
-
   </div>
 
+  {# Budget D sotto le foto #}
+  {% if room.d_interventi_lista %}
+  <div class="d-budget-strip">
+    {% for iv in room.d_interventi_lista %}
+    <div class="d-voce">
+      <span class="d-voce-label">{{ iv.voce }}</span>
+      <span class="d-voce-cost">€{{ iv.costo }}</span>
+    </div>
+    {% endfor %}
+    {% if room.d_costo_simulato %}
+    <div class="d-total">Budget stimato: €{{ room.d_costo_simulato }}</div>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {# Interventi #}
   <div class="int-section-title">Interventi</div>
   {% for iv in room.interventi %}
   <div class="intervention" style="border-left-color:{{ priority_color(iv.priorita) }}">
@@ -325,7 +348,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </div>
 {% endfor %}
 
-{# ──────────────── RIEPILOGO COSTI ──────────────── #}
+{# ── RIEPILOGO COSTI ── #}
 <div class="costs-section">
   <div class="section-title">Riepilogo costi</div>
   <hr class="divider"/>
@@ -362,7 +385,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 </div>
 
-{# ──────────────── ANNUNCIO + ROI ──────────────── #}
+{# ── ANNUNCIO + ROI ── #}
 <div class="listing-section">
   <div class="section-title">Annuncio e strategia STR</div>
   <hr class="divider"/>
@@ -388,30 +411,37 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 def generate_pdf(analysis: dict, prefs: dict, photos: list,
                 staged_results: list | None = None) -> bytes:
     """
-    Layout per stanza: 4 colonne — Originale | C4 Full | C5 Smart | D Layering ★
-
-    Fix multi-foto: indice_foto usa i (indice posizionale) come fallback, non 0.
+    Layout v17:
+      - Composit masonry PRIMA | DOPO nella valutazione generale
+      - Per ogni stanza: solo PRIMA | DOPO affiancate grandi
+      - Nessuna colonna C4/C5
     """
     stanze = analysis.get("stanze", [])
     for i, room in enumerate(stanze):
-        # FIX MULTI-FOTO: fallback su i, non su 0
+        # Foto originale
         idx = room.get("indice_foto")
         if idx is None or not isinstance(idx, int) or idx >= len(photos):
             idx = i if i < len(photos) else 0
             room["indice_foto"] = idx
 
-        raw_bytes = compress_image(photos[idx]["content"], max_width=1400, quality=82)
-        room["original_photo_b64"]  = base64.b64encode(raw_bytes).decode()
+        raw = compress_image(photos[idx]["content"], max_width=1400, quality=82)
+        room["original_photo_b64"]  = base64.b64encode(raw).decode()
         room["original_photo_mime"] = "image/jpeg"
 
-        room["staged_approaches"] = (
-            (staged_results[i] or {}) if staged_results and i < len(staged_results) else {}
+        # Foto D
+        d_b64 = None
+        if staged_results and i < len(staged_results):
+            d_b64 = (staged_results[i] or {}).get("D_FULL_SMART")
+        room["staged_d_b64"] = d_b64
+
+        # Budget D dalla mappa esperimenti
+        d_esp = next(
+            (e for e in room.get("esperimenti_staged", [])
+             if e.get("logic_id") == "D_FULL_SMART"),
+            {}
         )
-        room["esperimenti_staged_map"] = {
-            esp["logic_id"]: esp
-            for esp in room.get("esperimenti_staged", [])
-            if "logic_id" in esp
-        }
+        room["d_interventi_lista"] = d_esp.get("interventi_lista", [])
+        room["d_costo_simulato"]   = d_esp.get("costo_simulato")
 
     html_str = Template(HTML_TEMPLATE).render(
         analysis=analysis,
@@ -420,7 +450,6 @@ def generate_pdf(analysis: dict, prefs: dict, photos: list,
         priority_color=lambda p: PRIORITY_COLOR.get(p, "#888"),
     )
 
-    pdf_bytes = HTML(string=html_str).write_pdf(
+    return HTML(string=html_str).write_pdf(
         stylesheets=[CSS(string="@page { size: A4; margin: 0; }")]
     )
-    return pdf_bytes
