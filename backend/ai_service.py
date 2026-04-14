@@ -60,29 +60,32 @@ GUIDANCE = {
 # ── Palette autorizzate per stile ────────────────────────────────────────────
 STYLE_PALETTES = {
     "Scandinavian": {
-        "wall_colors":   "optical white, warm white, pearl grey, light greige. "
-                         "FORBIDDEN: orange, terracotta, red, electric blue, yellow.",
-        "accent":        "light oak wood, matte black metal, natural linen, soft grey textiles",
-        "wood_material": "Light Oak",
-        "metal_material":"Matte Black",
+        "wall_colors":        "optical white, warm white, pearl grey, light greige. "
+                              "FORBIDDEN: orange, terracotta, red, electric blue, yellow.",
+        "wall_finish_choice": "matte warm white",
+        "accent":             "light oak wood, matte black metal, natural linen, soft grey textiles",
+        "wood_material":      "Light Oak",
+        "metal_material":     "Matte Black",
         "kitchen_cabinet_color": "matte white",
         "kitchen_counter":       "light oak butcher block or white quartz",
     },
     "Industrial": {
-        "wall_colors":   "concrete grey, dark charcoal, warm brick white, off-white. "
-                         "FORBIDDEN: pink, pastel, bright orange, yellow.",
-        "accent":        "dark steel, reclaimed wood, exposed brick, Edison bulbs",
-        "wood_material": "Reclaimed Dark Wood",
-        "metal_material":"Dark Steel",
+        "wall_colors":        "concrete grey, dark charcoal, warm brick white, off-white. "
+                              "FORBIDDEN: pink, pastel, bright orange, yellow.",
+        "wall_finish_choice": "matte concrete grey",
+        "accent":             "dark steel, reclaimed wood, exposed brick, Edison bulbs",
+        "wood_material":      "Reclaimed Dark Wood",
+        "metal_material":     "Dark Steel",
         "kitchen_cabinet_color": "matte charcoal grey",
         "kitchen_counter":       "raw concrete or dark steel industrial countertop",
     },
     "Japandi": {
-        "wall_colors":   "wabi-sabi white, warm beige, pale sage, soft clay. "
-                         "FORBIDDEN: saturated colors, neon, orange.",
-        "accent":        "natural bamboo, stone, warm linen, matte ceramics",
-        "wood_material": "Blonde Bamboo",
-        "metal_material":"Brushed Brass",
+        "wall_colors":        "wabi-sabi white, warm beige, pale sage, soft clay. "
+                              "FORBIDDEN: saturated colors, neon, orange.",
+        "wall_finish_choice": "matte warm beige",
+        "accent":             "natural bamboo, stone, warm linen, matte ceramics",
+        "wood_material":      "Blonde Bamboo",
+        "metal_material":     "Brushed Brass",
         "kitchen_cabinet_color": "warm linen white",
         "kitchen_counter":       "natural stone or light bamboo",
     },
@@ -94,10 +97,11 @@ def _get_palette(style: str) -> dict:
     elif "Japandi" in key or "Japan" in key: key = "Japandi"
     elif "Industri" in key: key = "Industrial"
     return STYLE_PALETTES.get(key, {
-        "wall_colors":   f"neutral tones coherent with {style}. Avoid saturated colors.",
-        "accent":        f"materials coherent with {style}",
-        "wood_material": "Light Natural Wood",
-        "metal_material":"Matte Black",
+        "wall_colors":        f"neutral tones coherent with {style}. Avoid saturated colors.",
+        "wall_finish_choice": "matte neutral",
+        "accent":             f"materials coherent with {style}",
+        "wood_material":      "Light Natural Wood",
+        "metal_material":     "Matte Black",
         "kitchen_cabinet_color": "matte white",
         "kitchen_counter":       "light natural stone",
     })
