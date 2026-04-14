@@ -213,14 +213,62 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "montaggio":     int(budget * 0.15),
     }
 
+    # ── Palette autorizzate per stile (anchor prompting) ─────────────────────
+    STYLE_PALETTES = {
+        "Scandinavian": {
+            "wall_colors":   "optical white (bianco ottico), warm white (bianco caldo), "
+                             "pearl grey (grigio perla), light greige (greige chiarissimo). "
+                             "VIETATO ASSOLUTAMENTE: arancione, terracotta, rosso, "
+                             "blu elettrico, verde intenso, giallo.",
+            "accent":        "light oak wood (rovere chiaro), matte black metal, "
+                             "natural linen, soft grey textiles",
+            "wood_material": "Light Oak",
+            "metal_material":"Matte Black",
+        },
+        "Industrial": {
+            "wall_colors":   "concrete grey, dark charcoal, warm brick white, off-white. "
+                             "VIETATO: rosa, pastello, arancione brillante.",
+            "accent":        "dark steel, reclaimed wood, exposed brick, Edison bulbs",
+            "wood_material": "Reclaimed Dark Wood",
+            "metal_material":"Dark Steel",
+        },
+        "Japandi": {
+            "wall_colors":   "wabi-sabi white, warm beige, pale sage, soft clay. "
+                             "VIETATO: colori saturi, neon, arancione.",
+            "accent":        "natural bamboo, stone, warm linen, matte ceramics",
+            "wood_material": "Blonde Bamboo",
+            "metal_material":"Brushed Brass",
+        },
+    }
+    # Normalizzazione stile per lookup (case-insensitive, ignora varianti)
+    style_key = style.strip().title()
+    if "Scandi" in style_key:
+        style_key = "Scandinavian"
+    elif "Japandi" in style_key or "Japan" in style_key:
+        style_key = "Japandi"
+    elif "Industri" in style_key:
+        style_key = "Industrial"
+    palette = STYLE_PALETTES.get(style_key, {
+        "wall_colors":   f"neutral tones coherent with {style} style. "
+                         "Avoid saturated colors (orange, red, electric blue).",
+        "accent":        f"materials coherent with {style}",
+        "wood_material": "Light Natural Wood",
+        "metal_material":"Matte Black",
+    })
+
     system_instruction = (
         "Sei un Interior Designer senior e fotografo di interni specializzato in home staging. "
         "Prima di generare qualsiasi prompt Imagen, esegui una MAPPATURA SPAZIALE: "
         "1) Identifica la posizione della sorgente luminosa principale. "
         "2) Identifica i materiali esistenti (pavimento, pareti, soffitto). "
         "3) Stima la direzione delle ombre portate. "
-        "4) Identifica il COLORE ESATTO delle pareti attuali (es. 'giallo paglierino', "
-        "'beige opaco', 'bianco sporco') — questa informazione è critica per la variante E. "
+        "4) Identifica il COLORE ESATTO delle pareti attuali — critico per la variante E. "
+        f"REGOLA ASSOLUTA — PALETTE STILE {style.upper()}: "
+        f"I target_wall_color devono essere ESCLUSIVAMENTE: {palette['wall_colors']} "
+        f"REGOLA MATERIALI — COERENZA TRA STANZE: "
+        f"In OGNI prompt_stage2 di OGNI stanza usa SEMPRE gli stessi materiali: "
+        f"legno = '{palette['wood_material']}', metallo = '{palette['metal_material']}'. "
+        "Se soggiorno ha gambe in Light Oak, camera DEVE avere Light Oak. "
         "I prompt_en devono includere 'consistent shadows', 'global illumination', "
         "'ambient occlusion' per evitare l'effetto sticker. "
         "detected_elements elenca SOLO cio' che e' fisicamente visibile. "
@@ -241,12 +289,22 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         f"REGOLA MULTI-FOTO:\n{foto_index_list}\n"
         f"Genera ESATTAMENTE {n} oggetti in 'stanze'. Non raggruppare. Non saltare.\n\n"
 
-        f"STEP 1 — ANALISI VISIVA per ogni foto:\n"
+        f"STEP 1 — ANALISI VISIVA + PROFILO STILISTICO GLOBALE:\n"
+        f"PRIMA di analizzare le singole stanze, genera UN SOLO 'global_style_profile' "
+        f"per tutto l'appartamento:\n"
+        f"  primary_palette: 2-3 colori neutri AUTORIZZATI per {style}: {palette['wall_colors']}\n"
+        f"  wall_color_choice: SCEGLI UN SOLO colore parete tra quelli autorizzati "
+        f"e usalo in TUTTE le stanze (coerenza totale).\n"
+        f"  wood_material: usa SEMPRE '{palette['wood_material']}' per tutti i mobili in legno.\n"
+        f"  metal_material: usa SEMPRE '{palette['metal_material']}' per tutti i metalli.\n"
+        f"  accent_elements: {palette['accent']}\n\n"
+        f"POI per ogni foto:\n"
         f"  detected_elements: lista oggetti fisicamente visibili\n"
         f"  light_analysis: sorgente luce, materiali esistenti, direzione ombre\n"
         f"  current_wall_color: colore esatto pareti attuali (es. 'giallo paglierino opaco')\n"
-        f"  target_wall_color:  nuovo colore pareti coerente con {style}\n"
-        f"  target_wall_finish: finitura (es. 'venetian plaster warm grey', 'matte white')\n\n"
+        f"  target_wall_color: prendi da global_style_profile.wall_color_choice "
+        f"(STESSO per tutte le stanze)\n"
+        f"  target_wall_finish: finitura coerente (es. 'matte optical white')\n\n"
 
         f"STEP 2 — GENERA 2 VARIANTI TWO-STAGE per ogni stanza:\n\n"
 
@@ -269,14 +327,26 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         f"  1. INIZIA SEMPRE con conferma esplicita delle nuove pareti: "
         f"'The room is now perfectly clean with new [target_wall_finish] [target_wall_color] "
         f"walls from Stage 1. These walls show no trace of the previous [current_wall_color].'\n"
-        f"  2. Poi aggiungi stesso layering di D: tappeto, cuscini, pianta, mensola, "
+        f"  2. MATERIAL ANCHORING — usa SEMPRE questi materiali fissi in OGNI stanza:\n"
+        f"     legno: '{palette['wood_material']}' (es. comodini, gambe tavolo, mensole)\n"
+        f"     metallo: '{palette['metal_material']}' (es. lampade, strutture)\n"
+        f"  3. Poi aggiungi stesso layering di D: tappeto, cuscini, pianta, mensola, "
         f"stampe, lampada.\n"
-        f"  3. Inietta light_analysis per ombreggiature coerenti.\n"
-        f"  4. Chiudi con keyword fotorealismo + 'professional real estate photography, "
+        f"  4. Inietta light_analysis per ombreggiature coerenti.\n"
+        f"  5. Chiudi con keyword fotorealismo + 'professional real estate photography, "
         f"24mm wide angle lens, cinematic warm lighting, 8k.'\n\n"
 
         f"Restituisci SOLO questo JSON ({n} oggetti in 'stanze'):\n\n"
         "{{\n"
+        "  \"global_style_profile\": {{\n"
+        f"    \"style\": \"{style}\",\n"
+        f"    \"primary_palette\": [\"colore1 da palette autorizzata {style}\", \"colore2\"],\n"
+        "    \"wall_color_choice\": \"UN SOLO colore neutro scelto per TUTTE le stanze\",\n"
+        "    \"wall_finish_choice\": \"es. matte optical white\",\n"
+        f"    \"wood_material\": \"{palette['wood_material']}\",\n"
+        f"    \"metal_material\": \"{palette['metal_material']}\",\n"
+        f"    \"accent_elements\": \"{palette['accent']}\"\n"
+        "  }},\n"
         "  \"valutazione_generale\": \"analisi visiva complessiva\",\n"
         "  \"punti_di_forza\": [\"p1\"],\n"
         "  \"criticita\": [\"c1\"],\n"
@@ -293,8 +363,8 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "      \"indice_foto\": 0,\n"
         "      \"detected_elements\": [\"elemento visibile\", \"no windows visible se assenti\"],\n"
         "      \"current_wall_color\": \"es. giallo paglierino opaco\",\n"
-        "      \"target_wall_color\": \"es. warm grey\",\n"
-        "      \"target_wall_finish\": \"es. venetian plaster\",\n"
+        "      \"target_wall_color\": \"[STESSO valore di global_style_profile.wall_color_choice]\",\n"
+        "      \"target_wall_finish\": \"[STESSO valore di global_style_profile.wall_finish_choice]\",\n"
         "      \"light_analysis\": {{\n"
         "        \"light_source\": \"es. finestra sinistra, luce diffusa\",\n"
         "        \"existing_materials\": \"es. parquet chiaro, pareti gialle, soffitto bianco\",\n"
@@ -317,15 +387,15 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "          \"guidance_scale_stage1\": 8,\n"
         "          \"guidance_scale_stage2\": 10,\n"
         "          \"prompt_stage1\": \"Empty, clean room. Remove all furniture and clutter. Keep structure: [target_wall_finish] [target_wall_color] walls, [pavimento originale]. Photorealistic, consistent lighting matching [light_source], 8k.\",\n"
-        f"          \"prompt_stage2\": \"[Stanza vuota con [target_wall_finish] [target_wall_color] walls]. Add: [tappeto design] on [pavimento]. [Mobile principale se funzionale] with [3-4 cuscini texture misti]. Add: [mensola metallo nero con luci Edison]. Hang: [2 stampe cornici nere]. Corner: [Monstera in vaso terracotta]. Add: [lampada a stelo metallo nero]. Realistic fabric folds, reflections on polished surfaces, soft shadows matching [light_source], consistent shadows, global illumination, ambient occlusion, depth of field f/8, ray tracing, HDR. Professional real estate photography, 24mm wide angle lens, cinematic warm lighting, 8k.\",\n"
+        f"          \"prompt_stage2\": \"[Stanza vuota con [target_wall_finish] [target_wall_color] walls]. All furniture in {palette['wood_material']} wood, all metal in {palette['metal_material']}. Add: [tappeto design] on [pavimento]. [Mobile principale se funzionale] with [3-4 cuscini texture misti {palette['accent']}]. Add: {palette['metal_material']} metal shelf with Edison lights. Hang: [2 stampe cornici {palette['metal_material']}]. Corner: [Monstera in vaso terracotta]. Add: {palette['metal_material']} floor lamp. Realistic fabric folds, reflections on polished surfaces, soft shadows matching [light_source], consistent shadows, global illumination, ambient occlusion, depth of field f/8, ray tracing, HDR. Professional real estate photography, 24mm wide angle lens, cinematic warm lighting, 8k.\",\n"
         "          \"interventi_lista\": [\n"
-        "            {{\"voce\": \"Finitura pareti [target_wall_finish]\", \"costo\": 400}},\n"
-        "            {{\"voce\": \"Tappeto design — H&M Home\", \"costo\": 120}},\n"
+        f"            {{\"voce\": \"Finitura pareti [target_wall_finish] — armonia {style}\", \"costo\": 400}},\n"
+        f"            {{\"voce\": \"Tappeto design — {palette['accent'].split(',')[0]}\", \"costo\": 120}},\n"
         "            {{\"voce\": \"Cuscini 5 pz — Zara Home\", \"costo\": 80}},\n"
-        "            {{\"voce\": \"Mensola metallo nero + luci Edison\", \"costo\": 90}},\n"
-        "            {{\"voce\": \"2 stampe + cornici nere IKEA FISKBO\", \"costo\": 40}},\n"
+        f"            {{\"voce\": \"Mensola {palette['metal_material']} + luci Edison\", \"costo\": 90}},\n"
+        "            {{\"voce\": \"2 stampe + cornici IKEA FISKBO\", \"costo\": 40}},\n"
         "            {{\"voce\": \"Pianta Monstera + vaso terracotta\", \"costo\": 45}},\n"
-        "            {{\"voce\": \"Lampada a stelo metallo nero\", \"costo\": 60}}\n"
+        f"            {{\"voce\": \"Lampada a stelo {palette['metal_material']}\", \"costo\": 60}}\n"
         "          ],\n"
         "          \"costo_simulato\": 835\n"
         "        }},\n"
@@ -333,19 +403,19 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "          \"logic_id\": \"E_WALL_FORCE\",\n"
         "          \"guidance_scale_stage1\": 14,\n"
         "          \"guidance_scale_stage2\": 10,\n"
-        "          \"current_wall_color\": \"[colore esatto pareti attuali da current_wall_color]\",\n"
-        "          \"target_wall_color\": \"[nuovo colore da target_wall_color]\",\n"
-        "          \"target_wall_finish\": \"[finitura da target_wall_finish]\",\n"
+        "          \"current_wall_color\": \"[colore esatto pareti attuali]\",\n"
+        "          \"target_wall_color\": \"[DA global_style_profile.wall_color_choice]\",\n"
+        "          \"target_wall_finish\": \"[DA global_style_profile.wall_finish_choice]\",\n"
         "          \"prompt_stage1\": \"Complete architectural renovation. The original [current_wall_color] wall color MUST be entirely replaced. All walls are now [target_wall_finish] [target_wall_color]. Solid, opaque paint, no transparency, no bleed-through, no traces of [current_wall_color] visible anywhere. Empty room, no furniture. Consistent lighting matching [light_source]. Photorealistic, 8k.\",\n"
-        f"          \"prompt_stage2\": \"The room is now perfectly clean with new [target_wall_finish] [target_wall_color] walls from Stage 1. These walls show no trace of the previous [current_wall_color]. On these new walls: [tappeto design] on [pavimento]. [Mobile principale se funzionale] with [3-4 cuscini texture misti]. [mensola metallo nero con luci Edison] against the wall. [2 stampe cornici nere] hung above. Corner: [Monstera in vaso terracotta]. [lampada a stelo metallo nero] for warm atmosphere. Soft shadows matching [light_source], consistent shadows, global illumination, ambient occlusion, depth of field f/8, ray tracing, HDR. Professional real estate photography, 24mm wide angle lens, cinematic warm lighting, balanced exposure, highly detailed, 8k.\",\n"
+        f"          \"prompt_stage2\": \"The room is now perfectly clean with new [target_wall_finish] [target_wall_color] walls from Stage 1. These walls show no trace of the previous [current_wall_color]. MATERIAL ANCHORING: all furniture in {palette['wood_material']} wood, all metal in {palette['metal_material']} — same as all other rooms in this apartment. Add: [tappeto {style} design] on [pavimento]. [Mobile principale se funzionale] with [3-4 cuscini texture misti in {palette['accent'].split(',')[0]}]. {palette['metal_material']} metal shelf with Edison lights against wall. [2 stampe cornici {palette['metal_material']}] hung above. Corner: [Monstera in terracotta pot]. {palette['metal_material']} floor lamp for warm atmosphere. Soft shadows matching [light_source], consistent shadows, global illumination, ambient occlusion, depth of field f/8, ray tracing, HDR. Professional real estate photography, 24mm wide angle lens, cinematic warm lighting, balanced exposure, highly detailed, 8k.\",\n"
         "          \"interventi_lista\": [\n"
-        "            {{\"voce\": \"Tinteggiatura [target_wall_finish] [target_wall_color]\", \"costo\": 400}},\n"
+        f"            {{\"voce\": \"Tinteggiatura [target_wall_finish] — palette {style}\", \"costo\": 400}},\n"
         "            {{\"voce\": \"Tappeto design — H&M Home\", \"costo\": 120}},\n"
         "            {{\"voce\": \"Cuscini 5 pz — Zara Home\", \"costo\": 80}},\n"
-        "            {{\"voce\": \"Mensola metallo nero + luci Edison\", \"costo\": 90}},\n"
-        "            {{\"voce\": \"2 stampe + cornici nere IKEA FISKBO\", \"costo\": 40}},\n"
+        f"            {{\"voce\": \"Mensola {palette['metal_material']} + luci Edison\", \"costo\": 90}},\n"
+        "            {{\"voce\": \"2 stampe + cornici IKEA FISKBO\", \"costo\": 40}},\n"
         "            {{\"voce\": \"Pianta Monstera + vaso terracotta\", \"costo\": 45}},\n"
-        "            {{\"voce\": \"Lampada a stelo metallo nero\", \"costo\": 60}}\n"
+        f"            {{\"voce\": \"Lampada a stelo {palette['metal_material']}\", \"costo\": 60}}\n"
         "          ],\n"
         "          \"costo_simulato\": 835\n"
         "        }}\n"
