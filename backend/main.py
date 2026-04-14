@@ -1,6 +1,6 @@
 """
-HomeStager AI — FastAPI Backend
-Pipeline: Upload → Gemini 2.5 Flash → Imagen 3 → WeasyPrint PDF → SendGrid
+HomeStager AI — FastAPI Backend v18
+Pipeline: Upload → PhotoValidator → Gemini 2.5 Flash → Imagen 3 → WeasyPrint PDF → SendGrid
 """
 import base64
 import traceback
@@ -8,7 +8,10 @@ import uuid
 import asyncio
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from ai_service import analyze_with_gemini, generate_staged_photos, compress_image, _get_vertex_client
+from ai_service import (
+    analyze_with_gemini, generate_staged_photos,
+    validate_input_photos, compress_image, _get_vertex_client,
+)
 from pdf_service import generate_pdf
 from email_service import send_report_email
 from google.genai import types as genai_types
@@ -17,7 +20,7 @@ app = FastAPI(title="HomeStager AI")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # wildcard: permette chiamate dalla sandbox Claude.ai e da localhost
+    allow_origins=["*"],   # wildcard per lab sandbox + localhost + Vercel
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -54,17 +57,38 @@ async def analyze(
             "content_type": photo.content_type or "image/jpeg",
         })
 
+    # ── PhotoValidator — analisi qualità prima di avviare il job ──────────────
+    validation = await validate_input_photos(photo_data)
+    invalid_photos = [
+        {"index": i, "issue": validation["issues"][i], "suggestion": validation.get("suggestions", [""])[i]}
+        for i, ok in enumerate(validation["valid"])
+        if not ok
+    ]
+
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "processing", "progress": 0, "step": "Inizializzazione…"}
+    jobs[job_id] = {
+        "status": "processing",
+        "progress": 0,
+        "step": "Inizializzazione…",
+        # Esponi i warning di validazione subito nel job — il frontend può mostrarli
+        "validation": {
+            "warnings":       validation.get("warnings", []),
+            "invalid_photos": invalid_photos,
+            "layout_hint":    validation.get("layout_hint", ""),
+        }
+    }
 
     prefs = {
-        "budget": budget,
-        "style": style,
-        "location": location,
+        "budget":      budget,
+        "style":       style,
+        "location":    location,
         "destination": destination,
     }
     background_tasks.add_task(_process_job, job_id, photo_data, prefs, email)
-    return {"job_id": job_id}
+    return {
+        "job_id":    job_id,
+        "validation": jobs[job_id]["validation"],   # restituisce subito i warning
+    }
 
 
 @app.get("/status/{job_id}")
@@ -84,11 +108,8 @@ async def test_variant(
 ):
     """
     Endpoint di test per la sandbox di configurazione.
-    Riceve una foto + parametri di una variante Imagen, ritorna l'immagine generata in base64.
-    Bypassa la pipeline completa (niente Gemini, PDF, email).
-
-    Limite: guidance_scale viene cappato a 30 (valori > 30 restituiscono
-    silenziosamente 0 immagini in EDIT_MODE_DEFAULT).
+    Chiama Imagen direttamente senza pipeline completa.
+    guidance_scale cappato a 30 (>30 = 0 immagini silenzioso).
     """
     guidance_scale = min(float(guidance_scale), 30.0)
     content = await photo.read()
@@ -123,10 +144,8 @@ async def test_variant(
 
         return {
             "success": False,
-            "error": (
-                f"Imagen ha restituito 0 immagini (guidance={guidance_scale}). "
-                "Prova un valore <= 28."
-            ),
+            "error": f"Imagen ha restituito 0 immagini (guidance={guidance_scale}). "
+                     "Prova un valore <= 28.",
         }
 
     except Exception as e:
@@ -140,13 +159,11 @@ async def _process_job(job_id: str, photos: list, prefs: dict, email: str):
         jobs[job_id].update({"progress": progress, "step": step})
 
     try:
-        update(10, "Gemini analizza le foto…")
+        update(10, "Gemini analizza le foto (spatial anchor + style DNA)…")
         analysis = await analyze_with_gemini(photos, prefs)
 
-        update(35, "Imagen 3 genera le foto staged…")
+        update(35, "Imagen 3 genera D + E (KitchenBrutalistProtocol attivo)…")
         staged_results = await generate_staged_photos(photos, analysis)
-
-        update(70, "Compilazione scheda…")
 
         update(80, "Generazione PDF…")
         pdf_bytes = generate_pdf(analysis, prefs, photos, staged_results=staged_results)
@@ -155,23 +172,26 @@ async def _process_job(job_id: str, photos: list, prefs: dict, email: str):
         send_report_email(email, pdf_bytes, analysis, prefs)
 
         jobs[job_id] = {
-            "status": "completed",
+            "status":   "completed",
             "progress": 100,
-            "step": "Completato",
+            "step":     "Completato",
             "summary": {
-                "titolo": analysis.get("titolo_annuncio_suggerito", ""),
+                "titolo":       analysis.get("titolo_annuncio_suggerito", ""),
                 "totale_costi": analysis.get("riepilogo_costi", {}).get("totale", 0),
-                "incremento": analysis.get("tariffe", {}).get("incremento_percentuale", ""),
+                "incremento":   analysis.get("tariffe", {}).get("incremento_percentuale", ""),
+                "spatial_map":  analysis.get("spatial_map", {}),
             },
+            "validation": jobs[job_id].get("validation", {}),
         }
 
     except Exception as exc:
         tb = traceback.format_exc()
         print(tb)
         jobs[job_id] = {
-            "status": "error",
-            "progress": 0,
-            "step": "Errore",
-            "error": f"{type(exc).__name__}: {exc}",
+            "status":    "error",
+            "progress":  0,
+            "step":      "Errore",
+            "error":     f"{type(exc).__name__}: {exc}",
             "traceback": tb,
+            "validation": jobs[job_id].get("validation", {}),
         }
