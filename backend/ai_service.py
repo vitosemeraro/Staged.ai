@@ -1,17 +1,14 @@
 """
-AI Service v19 — Template-First + Structural Tagging
+AI Service v20 — Fix "Non disponibile" + Outdoor Protocol
 
-Strategia: Gemini restituisce SOLO variabili (colori, elementi, vincoli).
-Python costruisce i prompt Imagen con template hardcodati in Python.
-Questo elimina la "LLM Laziness" dove Gemini restituisce [COMPILA...].
-
-Moduli:
-  PhotoValidator        — invariato da v18
-  GlobalSpatialAnchor  — Gemini mappa adiacenze e STRUCTURAL_FIXED
-  TemplateFirst        — Python compone i prompt Imagen, non Gemini
-  StructuralTagging    — elementi STRUCTURAL_FIXED mai rimossi in Stage 1
-  KitchenBrutalistProtocol — template specifico per cucine
-  E guidance aggiornato: Stage1=16, Stage2=12
+Fix rispetto a v19:
+  A. Outdoor Protocol: balcone/terrazzo usa template separato senza "walls"
+  B. Guidance E: Stage1=14, Stage2=10 (16 produceva 0 immagini silenzioso)
+  C. Concurrency: max_workers=3, esecuzione sequenziale a coppie (anti-quota)
+  D. Prompt più corti e meno aggressivi (no "MUST", "ZERO") → meno safety blocks
+  E. Fix lookup stile: recupero da prefs_style iniettato nell'analysis
+  F. Fridge hardcoded in structural_fixed per cucine
+  G. Log prompt primi 150 char quando 0 immagini → debug in Cloud Run logs
 """
 import asyncio
 import base64
@@ -47,83 +44,110 @@ GEMINI_URL = (
     f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
 )
 
-# ── Guidance ──────────────────────────────────────────────────────────────────
-# EDIT_MODE_DEFAULT: >30 = 0 immagini silenzioso
-# E Stage1=16 (più aggressivo per pittura), Stage2=12 (mantiene struttura)
+# ── Guidance — valori sicuri testati ──────────────────────────────────────────
+# EDIT_MODE_DEFAULT: > ~15 può produrre 0 immagini silenzioso
 GUIDANCE = {
-    "D_STAGE1_CLEAN":   8,
-    "D_STAGE2_STAGE":  10,
-    "E_STAGE1_WALL":   16,   # alzato da 14 → 16 per forzare cambio colore
-    "E_STAGE2_STAGE":  12,   # alzato da 10 → 12 per mantenere nuove pareti
+    "D_STAGE1_CLEAN":   8,    # libertà massima per pulizia
+    "D_STAGE2_STAGE":  10,    # layering moderato
+    "E_STAGE1_WALL":   14,    # aggressivo sul colore (max sicuro)
+    "E_STAGE2_STAGE":  10,    # mantiene pareti, aggiunge arredo
+    "OUTDOOR_STAGE1":   6,    # molto libero per spazi aperti
+    "OUTDOOR_STAGE2":   8,    # aggiunge arredi esterni
 }
+
+# ── Concurrency — ridotto per evitare saturazione quota ──────────────────────
+# Con 5 stanze × 2 varianti × 2 stage = 20 call simultanee → quota exceeded
+# Con max_workers=3 e batching a 2 stanze per volta → ~6 call simultanee max
+_imagen_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="imagen")
+_gemini_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="gemini")
 
 # ── Palette per stile ─────────────────────────────────────────────────────────
 STYLE_PALETTES = {
     "Scandinavian": {
-        "wall_color":            "warm white",
-        "wall_finish":           "matte",
-        "wall_forbidden":        "orange, terracotta, red, electric blue, yellow, dark colors",
-        "wood":                  "Light Oak",
-        "metal":                 "Matte Black",
-        "textiles":              "natural linen, soft grey, cream cotton",
-        "kitchen_cabinet_color": "matte white",
-        "kitchen_counter":       "white quartz",
-        "kitchen_accent":        "Matte Black pendant lamp, potted herbs in white ceramic",
+        "wall_color": "warm white",      "wall_finish": "matte",
+        "wall_forbidden": "orange, terracotta, red, electric blue, yellow",
+        "wood": "Light Oak",             "metal": "Matte Black",
+        "textiles": "natural linen, soft grey cotton",
+        "kitchen_cabinet": "matte white",
+        "kitchen_counter": "white quartz",
+        "kitchen_accent":  "Matte Black pendant lamp, potted herbs",
     },
     "Industrial": {
-        "wall_color":            "warm off-white",
-        "wall_finish":           "matte concrete-effect",
-        "wall_forbidden":        "pink, pastel, bright orange, yellow, bright colors",
-        "wood":                  "Reclaimed Dark Wood",
-        "metal":                 "Dark Steel",
-        "textiles":              "dark grey linen, charcoal canvas, warm beige",
-        "kitchen_cabinet_color": "matte charcoal grey",
-        "kitchen_counter":       "dark industrial concrete-effect laminate",
-        "kitchen_accent":        "Dark Steel Edison pendant lamp, potted herbs in terracotta",
+        "wall_color": "warm off-white",  "wall_finish": "matte concrete-effect",
+        "wall_forbidden": "pink, pastel, bright orange, yellow",
+        "wood": "Reclaimed Dark Wood",   "metal": "Dark Steel",
+        "textiles": "dark grey linen, charcoal canvas",
+        "kitchen_cabinet": "matte charcoal grey",
+        "kitchen_counter": "dark concrete-effect laminate",
+        "kitchen_accent":  "Dark Steel Edison pendant lamp, terracotta herb pots",
     },
     "Japandi": {
-        "wall_color":            "warm greige",
-        "wall_finish":           "matte clay",
-        "wall_forbidden":        "saturated colors, neon, orange, electric blue",
-        "wood":                  "Blonde Bamboo",
-        "metal":                 "Brushed Brass",
-        "textiles":              "warm linen, undyed cotton, wabi-sabi textures",
-        "kitchen_cabinet_color": "warm linen white",
-        "kitchen_counter":       "natural light stone",
-        "kitchen_accent":        "Brushed Brass pendant lamp, ceramic pots with herbs",
+        "wall_color": "warm greige",     "wall_finish": "matte clay",
+        "wall_forbidden": "saturated colors, neon, orange, electric blue",
+        "wood": "Blonde Bamboo",         "metal": "Brushed Brass",
+        "textiles": "warm linen, undyed cotton",
+        "kitchen_cabinet": "warm linen white",
+        "kitchen_counter": "natural light stone",
+        "kitchen_accent":  "Brushed Brass pendant lamp, ceramic herb pots",
     },
     "Minimalista": {
-        "wall_color":            "light greige",
-        "wall_finish":           "matte",
-        "wall_forbidden":        "saturated colors, orange, red, dark colors",
-        "wood":                  "Light Natural Wood",
-        "metal":                 "Matte Black",
-        "textiles":              "natural linen, soft white, neutral grey",
-        "kitchen_cabinet_color": "matte white",
-        "kitchen_counter":       "light natural stone",
-        "kitchen_accent":        "Matte Black pendant lamp, minimalist ceramic vases",
+        "wall_color": "light greige",    "wall_finish": "matte",
+        "wall_forbidden": "saturated colors, orange, red, dark colors",
+        "wood": "Light Natural Wood",    "metal": "Matte Black",
+        "textiles": "natural linen, soft white, neutral grey",
+        "kitchen_cabinet": "matte white",
+        "kitchen_counter": "light natural stone",
+        "kitchen_accent":  "Matte Black pendant lamp, minimalist ceramic vases",
+    },
+    "Mid-Century Modern": {
+        "wall_color": "warm ivory",      "wall_finish": "matte",
+        "wall_forbidden": "grey, cold white, neon, electric blue",
+        "wood": "Walnut Wood",           "metal": "Brushed Gold",
+        "textiles": "mustard yellow, terracotta, olive green, warm beige",
+        "kitchen_cabinet": "sage green matte",
+        "kitchen_counter": "white marble or butcher block",
+        "kitchen_accent":  "Brushed Gold pendant lamp, retro ceramics",
+    },
+    "Boho Chic": {
+        "wall_color": "warm sand",       "wall_finish": "textured matte",
+        "wall_forbidden": "cold grey, electric blue, neon",
+        "wood": "Natural Rattan and Teak",  "metal": "Brushed Copper",
+        "textiles": "terracotta, rust, warm beige, macrame",
+        "kitchen_cabinet": "cream white",
+        "kitchen_counter": "warm wood butcher block",
+        "kitchen_accent":  "Brushed Copper pendant lamp, woven baskets",
     },
 }
 
+OUTDOOR_ROOM_TYPES = {"balcone", "terrazzo", "esterno", "giardino", "loggia",
+                       "balcony", "terrace", "outdoor", "garden"}
+
+
 def _get_palette(style: str) -> dict:
     key = style.strip().title()
-    if "Scandi" in key:   key = "Scandinavian"
-    elif "Japandi" in key or "Japan" in key: key = "Japandi"
-    elif "Industri" in key: key = "Industrial"
-    elif "Minimal" in key:  key = "Minimalista"
-    return STYLE_PALETTES.get(key, {
-        "wall_color":            "light greige",
-        "wall_finish":           "matte",
-        "wall_forbidden":        "saturated colors, bright orange, neon",
-        "wood":                  "Light Natural Wood",
-        "metal":                 "Matte Black",
-        "textiles":              "natural linen, neutral grey",
-        "kitchen_cabinet_color": "matte white",
-        "kitchen_counter":       "light natural stone",
-        "kitchen_accent":        "Matte Black pendant lamp",
-    })
+    for k in STYLE_PALETTES:
+        if k.lower() in key.lower() or key.lower() in k.lower():
+            return STYLE_PALETTES[k]
+    # Normalizzazione comuni
+    if "scandi" in key.lower():   return STYLE_PALETTES["Scandinavian"]
+    if "industri" in key.lower(): return STYLE_PALETTES["Industrial"]
+    if "japandi" in key.lower() or "japan" in key.lower(): return STYLE_PALETTES["Japandi"]
+    if "minimal" in key.lower():  return STYLE_PALETTES["Minimalista"]
+    if "mid" in key.lower() and "century" in key.lower(): return STYLE_PALETTES["Mid-Century Modern"]
+    if "boho" in key.lower():     return STYLE_PALETTES["Boho Chic"]
+    return {  # fallback neutro
+        "wall_color": "light greige", "wall_finish": "matte",
+        "wall_forbidden": "saturated colors",
+        "wood": "Light Natural Wood", "metal": "Matte Black",
+        "textiles": "natural linen, neutral grey",
+        "kitchen_cabinet": "matte white", "kitchen_counter": "light natural stone",
+        "kitchen_accent": "Matte Black pendant lamp",
+    }
+
 
 _vertex_client = None
+_analysis_cache: dict[str, dict] = {}
+
 
 def _get_vertex_client():
     global _vertex_client
@@ -131,11 +155,6 @@ def _get_vertex_client():
         print(f"[Imagen] init client project={PROJECT_ID} location={LOCATION}")
         _vertex_client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
     return _vertex_client
-
-_gemini_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="gemini")
-_imagen_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="imagen")
-
-_analysis_cache: dict[str, dict] = {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -158,23 +177,21 @@ def _validate_photos_sync(photos: list) -> dict:
             "mime_type": p["content_type"],
             "data": base64.b64encode(p["content"]).decode()
         }})
-
     parts.append({"text": (
-        f"Analizza queste {n} foto per AI home staging. Per ogni foto:\n"
-        "1. È sufficientemente illuminata? (scarta se buia)\n"
-        "2. Si vede abbastanza della stanza? (scarta se troppo stretta)\n"
-        "3. Elementi strutturali fissi chiaramente visibili? (frigo, armadio, finestre)\n"
-        "4. Tipo di stanza?\n"
-        "Restituisci SOLO JSON:\n"
-        "{\"photos\":[{\"index\":0,\"valid\":true,\"room_type\":\"soggiorno\","
-        "\"issue\":\"ok\",\"suggestion\":\"\","
-        "\"structural_elements_visible\":[\"frigorifero angolo nord-est\",\"armadio parete ovest\"]}],"
-        "\"global_warnings\":[],\"layout_hint\":\"\"}"
+        f"Analizza {n} foto per AI home staging. Per ogni foto:\n"
+        "1. È sufficientemente illuminata?\n"
+        "2. L'inquadratura mostra abbastanza della stanza?\n"
+        "3. Tipo stanza (soggiorno/cucina/camera/bagno/balcone/altro)?\n"
+        "4. Elementi strutturali fissi visibili (frigo, armadio, finestre)?\n"
+        "5. È uno spazio esterno (balcone, terrazzo)?\n"
+        'Restituisci JSON: {"photos":[{"index":0,"valid":true,"room_type":"soggiorno",'
+        '"is_outdoor":false,"issue":"ok","suggestion":"",'
+        '"structural_elements":["frigorifero angolo nord-est"]}],'
+        '"global_warnings":[],"layout_hint":""}'
     )})
-
     payload = {
         "system_instruction": {"parts": [{"text":
-            "Sei un esperto di fotografia immobiliare. Rispondi SOLO con JSON valido."
+            "Esperto di fotografia immobiliare. Rispondi SOLO con JSON valido."
         }]},
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4096,
@@ -184,24 +201,27 @@ def _validate_photos_sync(photos: list) -> dict:
         resp = httpx.post(GEMINI_URL, json=payload, timeout=60.0,
                           headers={"Content-Type": "application/json"})
         resp.raise_for_status()
-        parsed = _extract_json(resp.json()["candidates"][0]["content"]["parts"][0]["text"])
-        photos_data = parsed.get("photos", [])
-        print(f"[PhotoValidator] {sum(p.get('valid',True) for p in photos_data)}/{n} valide")
+        parsed = _extract_json(
+            resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        )
+        pds = parsed.get("photos", [])
+        print(f"[PhotoValidator] {sum(p.get('valid',True) for p in pds)}/{n} valide")
         return {
-            "valid":       [p.get("valid", True) for p in photos_data],
-            "issues":      [p.get("issue", "ok") for p in photos_data],
-            "room_types":  [p.get("room_type", "unknown") for p in photos_data],
-            "suggestions": [p.get("suggestion", "") for p in photos_data],
-            "structural":  [p.get("structural_elements_visible", []) for p in photos_data],
-            "warnings":    parsed.get("global_warnings", []),
-            "layout_hint": parsed.get("layout_hint", ""),
-            "all_valid":   all(p.get("valid", True) for p in photos_data),
+            "valid":      [p.get("valid", True) for p in pds],
+            "issues":     [p.get("issue", "ok") for p in pds],
+            "room_types": [p.get("room_type", "unknown") for p in pds],
+            "is_outdoor": [p.get("is_outdoor", False) for p in pds],
+            "suggestions":[p.get("suggestion", "") for p in pds],
+            "structural": [p.get("structural_elements", []) for p in pds],
+            "warnings":   parsed.get("global_warnings", []),
+            "layout_hint":parsed.get("layout_hint", ""),
+            "all_valid":  all(p.get("valid", True) for p in pds),
         }
     except Exception as e:
-        print(f"[PhotoValidator] ERRORE: {e} — procedo comunque")
+        print(f"[PhotoValidator] ERRORE: {e}")
         return {"valid":[True]*n, "issues":["skip"]*n, "room_types":["unknown"]*n,
-                "suggestions":[""]*n, "structural":[[]]*n,
-                "warnings":[], "layout_hint":"", "all_valid":True}
+                "is_outdoor":[False]*n, "suggestions":[""]*n,
+                "structural":[[]]*n, "warnings":[], "layout_hint":"", "all_valid":True}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -307,7 +327,7 @@ def _validate_stanze_count(analysis: dict, n_photos: int) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GEMINI ANALYSIS — restituisce solo VARIABILI, non prompt
+# Gemini Analysis — restituisce SOLO variabili
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def analyze_with_gemini(photos: list, prefs: dict) -> dict:
@@ -319,16 +339,13 @@ async def analyze_with_gemini(photos: list, prefs: dict) -> dict:
     result = await loop.run_in_executor(_gemini_executor, _gemini_sync, photos, prefs)
     result = _validate_stanze_count(result, len(photos))
     result = validate_and_fix_costs(result, prefs["budget"])
+    # Inietta stile nei metadata per recupero in generate_staged_photos
+    result["_prefs_style"] = prefs.get("style", "")
     _analysis_cache[key] = result
     return result
 
 
 def _gemini_sync(photos: list, prefs: dict) -> dict:
-    """
-    Template-First: Gemini restituisce SOLO le variabili necessarie.
-    I prompt Imagen vengono costruiti in Python con _build_prompt_*.
-    Questo elimina la "LLM Laziness" (placeholder non compilati).
-    """
     budget      = prefs["budget"]
     style       = prefs["style"]
     location    = prefs["location"]
@@ -344,94 +361,89 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "montaggio":     int(budget * 0.15),
     }
 
-    foto_index_list = "\n".join(
-        f"  FOTO {i} = stanza {i+1}" for i in range(n)
-    )
+    foto_list = "\n".join(f"  FOTO {i} = stanza {i+1}" for i in range(n))
 
     system_instruction = (
-        "Sei un Architetto Digitale specializzato in home staging. "
-        "Analizza le foto e restituisci SOLO le variabili richieste — "
-        "NON scrivere prompt Imagen. "
-        f"PALETTE AUTORIZZATA per {style}: pareti = {palette['wall_color']} {palette['wall_finish']}. "
-        f"VIETATO: {palette['wall_forbidden']}. "
-        f"Materiali fissi: legno={palette['wood']}, metallo={palette['metal']}. "
-        "STRUCTURAL_FIXED: elementi che NON devono mai essere rimossi o spostati "
-        "(frigorifero, armadio a muro, finestre, colonne strutturali). "
-        "Rispondi ESCLUSIVAMENTE con JSON valido, senza markdown."
+        "Sei un Architetto Digitale per home staging. "
+        "Restituisci SOLO le variabili richieste — NON scrivere prompt Imagen. "
+        f"Palette autorizzata {style}: pareti={palette['wall_color']} {palette['wall_finish']}. "
+        f"Vietato: {palette['wall_forbidden']}. "
+        f"Legno={palette['wood']}, Metallo={palette['metal']}. "
+        "STRUCTURAL_FIXED: frigorifero, armadi a muro, finestre — mai rimuovere. "
+        "Per balconi/terrazzi: is_outdoor=true, NON menzionare pareti. "
+        "Rispondi ESCLUSIVAMENTE con JSON valido senza markdown."
     )
 
     prompt = (
-        f"Analizza {n} foto di un appartamento per home staging {dest_label}.\n"
-        f"Budget \u20ac{budget} | Stile: {style} | Citta': {location}\n"
-        f"Distribuzione: Arredi \u20ac{alloc['arredi']} | "
-        f"Tinteggiatura \u20ac{alloc['tinteggiatura']} | "
-        f"Materiali \u20ac{alloc['materiali']} | Montaggio \u20ac{alloc['montaggio']}\n\n"
-        f"FOTO:\n{foto_index_list}\n\n"
-
-        f"STEP 0 — MAPPA SPAZIALE:\n"
-        f"Identifica stanze adiacenti e crea spatial_adjacencies.\n"
-        f"Per ogni adiacenza nota i vincoli spaziali critici.\n\n"
-
-        f"STEP 1 — PER OGNI FOTO, estrai queste variabili:\n"
-        f"  room_type: soggiorno|cucina|camera|bagno|altro\n"
+        f"Analizza {n} foto per home staging {dest_label}.\n"
+        f"Budget €{budget} | Stile: {style} | Città: {location}\n"
+        f"Budget: Arredi €{alloc['arredi']} | Tinteggiatura €{alloc['tinteggiatura']} | "
+        f"Materiali €{alloc['materiali']} | Montaggio €{alloc['montaggio']}\n\n"
+        f"FOTO:\n{foto_list}\n\n"
+        f"Per ogni foto estrai:\n"
+        f"  room_type: soggiorno|cucina|camera|bagno|balcone|altro\n"
         f"  is_kitchen: true/false\n"
-        f"  current_wall_color: colore esatto pareti (es. 'giallo paglierino')\n"
-        f"  light_source: posizione sorgente luce (es. 'finestra sinistra in alto')\n"
-        f"  shadow_direction: direzione ombre (es. 'verso destra e verso il basso')\n"
-        f"  floor_material: materiale pavimento (es. 'laminato chiaro')\n"
-        f"  structural_fixed: lista di elementi INAMOVIBILI con posizione:\n"
-        f"    - formato: 'nome_elemento|posizione' (es. 'frigorifero|angolo nord-est', 'armadio|intera parete ovest')\n"
-        f"    - INCLUDI SEMPRE: frigorifero, armadi a muro, finestre, colonne\n"
-        f"    - Gli armadi a muro BLOCCANO la disposizione del letto davanti — segnalalo\n"
-        f"  furniture_to_replace: lista mobili brutti da sostituire con il loro sostituto:\n"
-        f"    - formato: 'vecchio|nuovo|posizione' (es. 'divano rosso|divano grigio {palette['wood']}|centro stanza')\n"
-        f"    - Replacement logic cucina: mantieni tavolo nella stessa posizione\n"
-        f"    - NON spostare elementi structural_fixed\n"
-        f"  layering_add: lista elementi decorativi da aggiungere:\n"
-        f"    - tappeto, cuscini, piante, lampade, quadri coerenti con {style}\n"
-        f"    - cucina: aggiungi solo lampada a sospensione, piante aromatiche\n"
-        f"  kitchen_vars (solo se is_kitchen=true):\n"
-        f"    original_cabinet_color: colore ante attuali\n"
-        f"    original_cabinet_texture: materiale ante attuali\n\n"
-
-        f"STEP 2 — Genera interventi e costi per ogni stanza (in italiano).\n\n"
-
-        f"Restituisci questo JSON ({n} oggetti in 'stanze'):\n"
+        f"  is_outdoor: true se balcone/terrazzo/esterno\n"
+        f"  current_wall_color: colore esatto pareti attuali\n"
+        f"  light_source: posizione luce (es. 'finestra sinistra')\n"
+        f"  shadow_direction: direzione ombre (es. 'verso destra')\n"
+        f"  floor_material: materiale pavimento\n"
+        f"  structural_fixed: elementi inamovibili formato 'nome|posizione'\n"
+        f"    Cucine: INCLUDI SEMPRE 'frigorifero|posizione visibile'\n"
+        f"    Camere: armadio a muro BLOCCA posizione letto — segnalalo\n"
+        f"  furniture_to_replace: sostituzioni formato 'vecchio|nuovo|stessa_posizione'\n"
+        f"    Cucine: mantieni tavolo nella stessa posizione\n"
+        f"  layering_add: elementi decorativi da aggiungere (max 5 voci)\n"
+        f"    Balconi: solo sedie, tavolino, piante, tappeto esterno\n"
+        f"    Cucine: solo lampada sospensione, piante aromatiche\n"
+        f"  kitchen_vars: null oppure {{original_cabinet_color, original_cabinet_texture}}\n"
+        f"  outdoor_floor: solo per balconi, materiale pavimento esterno\n"
+        f"  outdoor_view: solo per balconi, descrizione vista\n\n"
+        f"Genera anche interventi e costi (in italiano) per ogni stanza.\n\n"
+        f"JSON da restituire ({n} oggetti in stanze):\n"
         "{{\n"
-        "  \"spatial_adjacencies\": [\n"
-        "    {{\"rooms\":[0,1], \"note\":\"vincolo spaziale\"}}\n"
-        "  ],\n"
-        "  \"wall_color_global\": \"colore unico per tutte le stanze\",\n"
-        "  \"wall_finish_global\": \"finitura unica per tutte le stanze\",\n"
-        "  \"valutazione_generale\": \"analisi\",\n"
+        "  \"wall_color_global\": \"colore unico per stanze interne\",\n"
+        "  \"wall_finish_global\": \"finitura unica per stanze interne\",\n"
+        "  \"valutazione_generale\": \"analisi complessiva\",\n"
         "  \"punti_di_forza\": [\"p1\"],\n"
         "  \"criticita\": [\"c1\"],\n"
         f"  \"potenziale_str\": \"potenziale a {location}\",\n"
-        "  \"tariffe\": {{\"attuale_notte\": \"\u20acXX-YY\", \"post_restyling_notte\": \"\u20acXX-YY\", \"incremento_percentuale\": \"XX%\"}},\n"
+        "  \"tariffe\": {{\n"
+        "    \"attuale_notte\": \"\u20acXX-YY\",\n"
+        "    \"post_restyling_notte\": \"\u20acXX-YY\",\n"
+        "    \"incremento_percentuale\": \"XX%\"\n"
+        "  }},\n"
         f"  \"stanze\": [\n"
-        f"    /* {n} oggetti, uno per foto */\n"
         "    {{\n"
         "      \"nome\": \"Nome stanza\",\n"
         "      \"indice_foto\": 0,\n"
         "      \"room_type\": \"soggiorno\",\n"
         "      \"is_kitchen\": false,\n"
+        "      \"is_outdoor\": false,\n"
         "      \"current_wall_color\": \"giallo paglierino\",\n"
         "      \"light_source\": \"finestra sinistra\",\n"
-        "      \"shadow_direction\": \"ombre verso destra\",\n"
+        "      \"shadow_direction\": \"verso destra\",\n"
         "      \"floor_material\": \"laminato chiaro\",\n"
-        "      \"structural_fixed\": [\"frigorifero|angolo nord-est\", \"armadio|intera parete ovest — NON posizionare letto davanti\"],\n"
-        "      \"furniture_to_replace\": [\"divano rosso|divano grigio lineare tessuto neutro|centro stanza\"],\n"
-        "      \"layering_add\": [\"tappeto neutro\", \"cuscini lino\", \"lampada stelo\", \"pianta angolo\", \"2 quadri sopra divano\"],\n"
+        "      \"structural_fixed\": [\"armadio|intera parete ovest — no letto davanti\"],\n"
+        "      \"furniture_to_replace\": [\"divano rosso|divano grigio lineare|stessa posizione\"],\n"
+        "      \"layering_add\": [\"tappeto neutro\", \"cuscini lino\", \"lampada stelo\", \"pianta\"],\n"
         "      \"kitchen_vars\": null,\n"
+        "      \"outdoor_floor\": null,\n"
+        "      \"outdoor_view\": null,\n"
         "      \"stato_attuale\": \"descrizione\",\n"
         "      \"interventi\": [\n"
-        "        {{\"titolo\": \"nome\", \"dettaglio\": \"dettaglio\", \"costo_min\": 50, \"costo_max\": 100, \"priorita\": \"alta\", \"dove_comprare\": \"negozio\"}}\n"
+        "        {{\"titolo\": \"nome\", \"dettaglio\": \"dettaglio\","
+        "\"costo_min\": 50, \"costo_max\": 100, \"priorita\": \"alta\","
+        "\"dove_comprare\": \"negozio\"}}\n"
         "      ],\n"
         "      \"costo_totale_stanza\": 350\n"
         "    }}\n"
         "  ],\n"
-        "  \"riepilogo_costi\": {{\"manodopera_tinteggiatura\":0,\"materiali_pittura\":0,\"arredi_complementi\":0,\"montaggio_varie\":0,\"totale\":0,\"budget_residuo\":0,\"nota_budget\":\"\"}},\n"
-        "  \"piano_acquisti\": [{{\"categoria\":\"Arredi\",\"articoli\":[\"item\"],\"budget_stimato\":0,\"negozi_consigliati\":\"IKEA, H&M Home\"}}],\n"
+        "  \"riepilogo_costi\": {{\"manodopera_tinteggiatura\":0,\"materiali_pittura\":0,"
+        "\"arredi_complementi\":0,\"montaggio_varie\":0,\"totale\":0,"
+        "\"budget_residuo\":0,\"nota_budget\":\"\"}},\n"
+        "  \"piano_acquisti\": [{{\"categoria\":\"Arredi\",\"articoli\":[\"item\"],"
+        "\"budget_stimato\":0,\"negozi_consigliati\":\"IKEA, H&M Home\"}}],\n"
         "  \"titolo_annuncio_suggerito\": \"Titolo max 50 car\",\n"
         "  \"highlights_str\": [\"h1\",\"h2\",\"h3\"],\n"
         "  \"roi_restyling\": \"ROI...\"\n"
@@ -447,383 +459,368 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         }})
     parts.append({"text": prompt})
 
-    payload = {
-        "system_instruction": {"parts": [{"text": system_instruction}]},
-        "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 65536,
-            "responseMimeType": "application/json"
-        }
-    }
-
-    resp = httpx.post(GEMINI_URL, json=payload, timeout=180.0,
-                      headers={"Content-Type": "application/json"})
+    resp = httpx.post(GEMINI_URL,
+                      json={"system_instruction": {"parts": [{"text": system_instruction}]},
+                            "contents": [{"role": "user", "parts": parts}],
+                            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 65536,
+                                                 "responseMimeType": "application/json"}},
+                      timeout=180.0, headers={"Content-Type": "application/json"})
     resp.raise_for_status()
-
-    data = resp.json()
-    text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    text   = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
     result = _extract_json(text)
-    print(f"[Gemini] stanze={len(result.get('stanze',[]))}/{n} | "
-          f"adj={len(result.get('spatial_adjacencies',[]))}")
+    print(f"[Gemini] stanze={len(result.get('stanze',[]))}/{n}  "
+          f"wall_color_global={result.get('wall_color_global','?')!r}")
     return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TEMPLATE-FIRST: Python costruisce i prompt Imagen
+# Template builders — prompt corti e sicuri (no MUST/ZERO)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _structural_fixed_clause(structural_fixed: list) -> str:
-    """Genera la clausola DO NOT REMOVE per elementi strutturali."""
-    if not structural_fixed:
+OUTDOOR_ROOM_TYPES = {"balcone", "terrazzo", "esterno", "giardino",
+                       "balcony", "terrace", "outdoor", "loggia"}
+
+
+def _is_outdoor(room: dict) -> bool:
+    rt = (room.get("room_type") or "").lower()
+    return room.get("is_outdoor", False) or rt in OUTDOOR_ROOM_TYPES
+
+
+def _structural_clause(structural_fixed: list, is_kitchen: bool) -> str:
+    """Genera clausole di protezione brevi per elementi strutturali."""
+    items = list(structural_fixed or [])
+    # Fridge hardcoded per cucine
+    if is_kitchen:
+        fridge_present = any("frigo" in s.lower() or "refriger" in s.lower()
+                             for s in items)
+        if not fridge_present:
+            items.insert(0, "frigorifero|posizione attuale")
+
+    if not items:
         return ""
-    clauses = []
-    for item in structural_fixed:
-        parts = item.split("|")
-        name = parts[0].strip()
-        pos  = parts[1].strip() if len(parts) > 1 else "its original position"
-        clauses.append(
-            f"DO NOT REMOVE OR CHANGE the {name} located at {pos}. "
-            f"Keep at least 90cm of clear access space in front of {name}."
-        )
-    return " ".join(clauses)
+    parts = []
+    for item in items[:4]:  # max 4 per brevità
+        name = item.split("|")[0].strip()
+        pos  = item.split("|")[1].strip() if "|" in item else "its position"
+        parts.append(f"Keep {name} at {pos} unchanged.")
+    return " ".join(parts)
 
 
-def _build_d_stage1(room: dict, palette: dict, wall_color: str, wall_finish: str) -> str:
-    """Template Stage 1 per D: pulisce la stanza, applica nuove pareti."""
-    sf_clause = _structural_fixed_clause(room.get("structural_fixed", []))
-    floor     = room.get("floor_material", "existing floor")
-    light     = room.get("light_source", "natural light")
+def _repl_text(replacements: list, wood: str) -> str:
+    """Replacement logic: max 2 sostituzioni per brevità prompt."""
+    out = []
+    for r in (replacements or [])[:2]:
+        p = r.split("|")
+        if len(p) >= 3:
+            old, new, pos = p[0].strip(), p[1].strip(), p[2].strip()
+            out.append(f"Replace {old} with {new} in {wood}, same spot.")
+    return " ".join(out)
+
+
+# ── D templates ───────────────────────────────────────────────────────────────
+
+def _build_d_stage1(room: dict, palette: dict, wc: str, wf: str) -> str:
+    sf   = _structural_clause(room.get("structural_fixed", []), room.get("is_kitchen", False))
+    fl   = room.get("floor_material", "existing floor")
+    lt   = room.get("light_source", "natural light")
     return (
-        f"Achromatic blank room. Remove all furniture, clutter, objects and decor. "
-        f"{sf_clause} "
-        f"Paint ALL walls in {wall_finish} {wall_color} — solid, opaque, complete coverage. "
-        f"Keep original {floor} floor unchanged. "
-        f"Empty clean room ready for new furnishing. "
-        f"Consistent lighting from {light}. Photorealistic, 8k."
+        f"Empty clean room, all furniture removed. "
+        f"Walls repainted in {wf} {wc}. "
+        f"Keep {fl} floor. {sf} "
+        f"Consistent light from {lt}. Photorealistic interior, 8k."
     )
 
 
-def _build_d_stage2(room: dict, palette: dict, wall_color: str, wall_finish: str) -> str:
-    """Template Stage 2 per D: aggiunge layering su stanza vuota."""
-    sf_clause   = _structural_fixed_clause(room.get("structural_fixed", []))
-    replacements = room.get("furniture_to_replace", [])
-    layering     = room.get("layering_add", [])
-    light        = room.get("light_source", "natural light")
-    shadow       = room.get("shadow_direction", "soft shadows")
-    floor        = room.get("floor_material", "existing floor")
-
-    # Replacement logic
-    repl_text = ""
-    for r in replacements:
-        parts = r.split("|")
-        if len(parts) >= 3:
-            old, new, pos = parts[0].strip(), parts[1].strip(), parts[2].strip()
-            repl_text += (
-                f"In place of the {old}, place a {new} in {palette['wood']} wood "
-                f"at {pos}, same footprint as original. "
-            )
-
-    # Layering text
-    layer_text = ", ".join(layering) if layering else "decorative cushions, small plant, area rug"
-
+def _build_d_stage2(room: dict, palette: dict, wc: str, wf: str) -> str:
+    sf    = _structural_clause(room.get("structural_fixed", []), room.get("is_kitchen", False))
+    repl  = _repl_text(room.get("furniture_to_replace", []), palette["wood"])
+    layer = ", ".join((room.get("layering_add") or [])[:4]) or "area rug, cushions, plant"
+    lt    = room.get("light_source", "natural light")
+    sh    = room.get("shadow_direction", "soft shadows")
     return (
-        f"The room features {wall_finish} {wall_color} walls on all surfaces. "
-        f"{sf_clause} "
-        f"{repl_text}"
-        f"Add: {layer_text}. "
-        f"All wood in {palette['wood']}, all metal in {palette['metal']}, "
-        f"textiles in {palette['textiles']}. "
-        f"Soft shadows matching {light}, falling {shadow}. "
-        f"Consistent shadows, global illumination, ambient occlusion, depth of field f/8, HDR. "
-        f"Professional real estate photography, 24mm wide angle lens, cinematic warm lighting, "
-        f"balanced exposure, highly detailed, 8k."
+        f"{wf} {wc} walls. {sf} {repl} "
+        f"Add: {layer}. "
+        f"Wood: {palette['wood']}, Metal: {palette['metal']}, "
+        f"Textiles: {palette['textiles']}. "
+        f"Light from {lt}, shadows {sh}. "
+        f"Global illumination, ambient occlusion, depth of field f/8. "
+        f"Professional real estate photo, 24mm, cinematic warm light, 8k."
     )
 
 
-def _build_e_stage1(room: dict, palette: dict, wall_color: str, wall_finish: str) -> str:
-    """Template Stage 1 per E: più aggressivo, forza cambio colore pareti."""
-    sf_clause     = _structural_fixed_clause(room.get("structural_fixed", []))
-    current_color = room.get("current_wall_color", "original color")
-    light         = room.get("light_source", "natural light")
-    floor         = room.get("floor_material", "existing floor")
+# ── E templates (wall force) ──────────────────────────────────────────────────
 
-    is_kitchen = room.get("is_kitchen", False)
-    kitchen_vars = room.get("kitchen_vars") or {}
-    orig_cab = kitchen_vars.get("original_cabinet_color", "beige")
-    orig_tex = kitchen_vars.get("original_cabinet_texture", "")
+def _build_e_stage1(room: dict, palette: dict, wc: str, wf: str) -> str:
+    sf    = _structural_clause(room.get("structural_fixed", []), room.get("is_kitchen", False))
+    cur   = room.get("current_wall_color", "original color")
+    lt    = room.get("light_source", "natural light")
+    fl    = room.get("floor_material", "existing floor")
 
-    kitchen_clause = ""
-    if is_kitchen:
-        kitchen_clause = (
-            f"Strip all {orig_cab} {orig_tex} cabinet doors from their original finish. "
-            f"Repaint all cabinet fronts in {palette['kitchen_cabinet_color']} matte finish — "
-            f"solid opaque coverage, no {orig_cab} showing through. "
-            f"Replace countertop with {palette['kitchen_counter']}. "
+    kitchen_part = ""
+    if room.get("is_kitchen", False):
+        kv      = room.get("kitchen_vars") or {}
+        cab_col = kv.get("original_cabinet_color", "beige")
+        kitchen_part = (
+            f"Repaint kitchen cabinet fronts in {palette['kitchen_cabinet']} — "
+            f"cover all {cab_col} surfaces completely. "
+            f"Change countertop to {palette['kitchen_counter']}. "
         )
 
     return (
-        f"Complete architectural renovation. Achromatic blank room. "
-        f"The original {current_color} wall color MUST be entirely replaced. "
-        f"ALL walls are now {wall_finish} {wall_color} — "
-        f"solid opaque paint, ZERO bleed-through of {current_color}, "
-        f"no traces of original color anywhere on any surface. "
-        f"{kitchen_clause}"
-        f"{sf_clause} "
-        f"Keep original {floor} floor unchanged. "
-        f"Remove all furniture and clutter except structural_fixed elements. "
-        f"Consistent lighting from {light}. Photorealistic, 8k."
+        f"Renovated room. Replace {cur} walls with {wf} {wc} paint — full coverage. "
+        f"{kitchen_part}{sf} "
+        f"Keep {fl} floor. Remove furniture and clutter. "
+        f"Light from {lt}. Photorealistic, 8k."
     )
 
 
-def _build_e_stage2(room: dict, palette: dict, wall_color: str, wall_finish: str) -> str:
-    """Template Stage 2 per E: conferma nuove pareti + layering + materiali."""
-    sf_clause    = _structural_fixed_clause(room.get("structural_fixed", []))
-    replacements = room.get("furniture_to_replace", [])
-    layering     = room.get("layering_add", [])
-    light        = room.get("light_source", "natural light")
-    shadow       = room.get("shadow_direction", "soft shadows")
-    current_col  = room.get("current_wall_color", "original color")
+def _build_e_stage2(room: dict, palette: dict, wc: str, wf: str) -> str:
+    sf    = _structural_clause(room.get("structural_fixed", []), room.get("is_kitchen", False))
+    cur   = room.get("current_wall_color", "original color")
+    lt    = room.get("light_source", "natural light")
+    sh    = room.get("shadow_direction", "soft shadows")
 
-    is_kitchen   = room.get("is_kitchen", False)
-    kitchen_vars = room.get("kitchen_vars") or {}
-    orig_cab     = kitchen_vars.get("original_cabinet_color", "beige")
-
-    # Conferma nuove pareti (forza il modello a "ricordare" lo Stage 1)
-    wall_confirm = (
-        f"Working on the newly painted {wall_finish} {wall_color} walls from Stage 1. "
-        f"These walls show absolutely zero trace of the previous {current_col}. "
-    )
-
-    # Kitchen specific
     kitchen_layer = ""
-    if is_kitchen:
+    if room.get("is_kitchen", False):
+        kv      = room.get("kitchen_vars") or {}
+        cab_col = kv.get("original_cabinet_color", "beige")
         kitchen_layer = (
-            f"The {palette['kitchen_cabinet_color']} kitchen cabinets from Stage 1 are now repainted. "
-            f"No {orig_cab} visible anywhere on the cabinets. "
+            f"Kitchen now has {palette['kitchen_cabinet']} cabinets, no {cab_col} visible. "
             f"Add {palette['kitchen_accent']}. "
-            f"Replace dining table with {palette['wood']} wood table in same position. "
+            f"Keep dining table in same position. "
         )
+        repl = ""
+    else:
+        repl = _repl_text(room.get("furniture_to_replace", []), palette["wood"])
 
-    # Replacement logic per stanze non-cucina
-    repl_text = ""
-    if not is_kitchen:
-        for r in replacements:
-            parts = r.split("|")
-            if len(parts) >= 3:
-                old, new, pos = parts[0].strip(), parts[1].strip(), parts[2].strip()
-                repl_text += (
-                    f"In place of the {old}, place a {new} in {palette['wood']} wood "
-                    f"at {pos}, same footprint as original. "
-                )
-
-    layer_text = ", ".join(layering) if layering else "area rug, cushions, plant, floor lamp"
+    layer = ", ".join((room.get("layering_add") or [])[:4]) or "area rug, cushions, plant"
 
     return (
-        f"{wall_confirm}"
-        f"{sf_clause} "
-        f"{kitchen_layer}"
-        f"{repl_text}"
-        f"Add: {layer_text}. "
-        f"MATERIAL ANCHORING — same as all other rooms: "
-        f"all wood in {palette['wood']}, all metal in {palette['metal']}, "
-        f"textiles in {palette['textiles']}. "
-        f"Soft shadows matching {light}, falling {shadow}. "
-        f"Consistent shadows, global illumination, ambient occlusion, "
-        f"depth of field f/8, ray tracing, HDR. "
-        f"Professional real estate photography, 24mm wide angle lens, "
-        f"cinematic warm lighting, balanced exposure, highly detailed, 8k."
+        f"Newly painted {wf} {wc} walls (no {cur} remaining). {sf} "
+        f"{kitchen_layer}{repl}"
+        f"Add: {layer}. "
+        f"Wood: {palette['wood']}, Metal: {palette['metal']}, "
+        f"Textiles: {palette['textiles']}. "
+        f"Light from {lt}, shadows {sh}. "
+        f"Global illumination, ambient occlusion, depth of field f/8, HDR. "
+        f"Professional real estate photo, 24mm, cinematic warm light, 8k."
+    )
+
+
+# ── Outdoor templates (balcone/terrazzo) ──────────────────────────────────────
+
+def _build_outdoor_stage1(room: dict, palette: dict) -> str:
+    """Stage 1 outdoor: rimuove ingombri, mantiene vista e pavimento."""
+    fl   = room.get("outdoor_floor") or room.get("floor_material", "existing floor tiles")
+    view = room.get("outdoor_view", "city view")
+    return (
+        f"Outdoor balcony staging. "
+        f"Keep original sky, city view ({view}), and exterior building elements unchanged. "
+        f"Remove clutter: drying racks, old furniture, scattered objects. "
+        f"Keep {fl} floor clean. "
+        f"No walls added — this is an open outdoor space. "
+        f"Bright natural daylight. Photorealistic exterior photo, 8k."
+    )
+
+
+def _build_outdoor_stage2(room: dict, palette: dict) -> str:
+    """Stage 2 outdoor: aggiunge arredo da esterno."""
+    layer = ", ".join((room.get("layering_add") or [])[:4]) or \
+            "folding table, 2 chairs, potted plants, outdoor rug"
+    fl    = room.get("outdoor_floor") or room.get("floor_material", "existing floor")
+    view  = room.get("outdoor_view", "city view")
+    return (
+        f"Staged balcony. Keep original sky and {view}. "
+        f"Keep {fl} floor and building exterior railings unchanged. "
+        f"Add outdoor furniture: {layer}. "
+        f"Materials: {palette['wood']} and {palette['metal']}. "
+        f"Bright natural daylight, no interior walls visible. "
+        f"Professional exterior photo, wide angle, 8k."
     )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STAGED PHOTOS
+# STAGED PHOTOS — batched sequentially to avoid quota saturation
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def generate_staged_photos(photos: list, analysis: dict) -> list:
+    """
+    Processa le stanze in batch sequenziali di 2 per evitare saturazione quota.
+    Max 2 stanze × 2 varianti × 2 stage = 8 call per batch (con 3 workers).
+    """
     stanze = analysis.get("stanze", [])
     loop   = asyncio.get_running_loop()
-    all_futures = []
 
-    # Colore parete globale: preferisce il valore globale, fallback per stanza
-    wall_color_global  = analysis.get("wall_color_global", "")
-    wall_finish_global = analysis.get("wall_finish_global", "matte")
-
-    for i, room in enumerate(stanze):
-        idx         = room.get("indice_foto", i)
-        photo_bytes = photos[idx]["content"] if idx < len(photos) else None
-        if not photo_bytes:
-            continue
-
-        # Colore parete: usa globale se disponibile
-        style   = analysis.get("global_style_profile", {}).get("style", "")
-        palette = _get_palette(style or "")
-        wc  = wall_color_global  or palette["wall_color"]
-        wf  = wall_finish_global or palette["wall_finish"]
-
-        # Costruzione prompt con template Python (non Gemini)
-        d_p1 = _build_d_stage1(room, palette, wc, wf)
-        d_p2 = _build_d_stage2(room, palette, wc, wf)
-        e_p1 = _build_e_stage1(room, palette, wc, wf)
-        e_p2 = _build_e_stage2(room, palette, wc, wf)
-
-        cwc        = room.get("current_wall_color", "")
-        is_kitchen = room.get("is_kitchen", False)
-
-        all_futures.append(("D_FULL_SMART", i,
-            loop.run_in_executor(_imagen_executor, _approach_D_two_stage,
-                photo_bytes, d_p1, d_p2,
-                GUIDANCE["D_STAGE1_CLEAN"], GUIDANCE["D_STAGE2_STAGE"])
-        ))
-        all_futures.append(("E_WALL_FORCE", i,
-            loop.run_in_executor(_imagen_executor, _approach_E_two_stage,
-                photo_bytes, e_p1, e_p2,
-                GUIDANCE["E_STAGE1_WALL"], GUIDANCE["E_STAGE2_STAGE"],
-                cwc, is_kitchen)
-        ))
+    # Fix lookup stile — v19 bug: cercava in global_style_profile ma non esiste
+    style   = (analysis.get("_prefs_style") or
+               analysis.get("global_style_profile", {}).get("style") or "")
+    palette = _get_palette(style)
+    wc      = analysis.get("wall_color_global") or palette["wall_color"]
+    wf      = analysis.get("wall_finish_global") or palette["wall_finish"]
 
     results = [{} for _ in stanze]
-    gathered = await asyncio.gather(
-        *[f for _, _, f in all_futures],
-        return_exceptions=True
-    )
-    for (key, room_idx, _), result in zip(all_futures, gathered):
-        if isinstance(result, Exception):
-            print(f"[{key} stanza {room_idx}] ERRORE: {result}")
-            results[room_idx][key] = None
-        else:
-            results[room_idx][key] = result
+
+    # Batch size 2: al massimo 2 stanze elaborate in parallelo alla volta
+    BATCH = 2
+    for batch_start in range(0, len(stanze), BATCH):
+        batch_rooms = stanze[batch_start:batch_start + BATCH]
+        batch_futures = []
+
+        for i, room in enumerate(batch_rooms):
+            room_idx = batch_start + i
+            idx      = room.get("indice_foto", room_idx)
+            pb       = photos[idx]["content"] if idx < len(photos) else None
+            if not pb:
+                continue
+
+            outdoor = _is_outdoor(room)
+            is_kitchen = room.get("is_kitchen", False)
+
+            if outdoor:
+                p1 = _build_outdoor_stage1(room, palette)
+                p2 = _build_outdoor_stage2(room, palette)
+                g1 = GUIDANCE["OUTDOOR_STAGE1"]
+                g2 = GUIDANCE["OUTDOOR_STAGE2"]
+                batch_futures.append(("D_FULL_SMART", room_idx,
+                    loop.run_in_executor(_imagen_executor,
+                        _approach_outdoor, pb, p1, p2, g1, g2)
+                ))
+                batch_futures.append(("E_WALL_FORCE", room_idx,
+                    loop.run_in_executor(_imagen_executor,
+                        _approach_outdoor, pb, p1, p2, g1, g2)
+                ))
+            else:
+                d1 = _build_d_stage1(room, palette, wc, wf)
+                d2 = _build_d_stage2(room, palette, wc, wf)
+                e1 = _build_e_stage1(room, palette, wc, wf)
+                e2 = _build_e_stage2(room, palette, wc, wf)
+                cwc = room.get("current_wall_color", "")
+
+                batch_futures.append(("D_FULL_SMART", room_idx,
+                    loop.run_in_executor(_imagen_executor,
+                        _approach_two_stage, pb, d1, d2,
+                        GUIDANCE["D_STAGE1_CLEAN"], GUIDANCE["D_STAGE2_STAGE"],
+                        "D", cwc, is_kitchen)
+                ))
+                batch_futures.append(("E_WALL_FORCE", room_idx,
+                    loop.run_in_executor(_imagen_executor,
+                        _approach_two_stage, pb, e1, e2,
+                        GUIDANCE["E_STAGE1_WALL"], GUIDANCE["E_STAGE2_STAGE"],
+                        "E", cwc, is_kitchen)
+                ))
+
+        if batch_futures:
+            gathered = await asyncio.gather(
+                *[f for _, _, f in batch_futures],
+                return_exceptions=True
+            )
+            for (key, room_idx, _), result in zip(batch_futures, gathered):
+                if isinstance(result, Exception):
+                    print(f"[{key} stanza {room_idx}] EXC: {result}")
+                    results[room_idx][key] = None
+                else:
+                    results[room_idx][key] = result
+
+        print(f"[Batch] stanze {batch_start+1}–{batch_start+len(batch_rooms)} completate")
 
     return results
 
 
-# ── D two-stage (INVARIATA) ───────────────────────────────────────────────────
+# ── Core Imagen call ──────────────────────────────────────────────────────────
 
-def _approach_D_two_stage(photo_bytes: bytes,
-                           p1: str, p2: str,
-                           g1: int, g2: int) -> str | None:
+def _call_imagen(label: str, compressed: bytes, prompt: str,
+                 guidance: float, negative: str) -> bytes | None:
+    """Singola chiamata Imagen con log del prompt se fallisce."""
+    client = _get_vertex_client()
     try:
-        compressed = compress_image(photo_bytes, max_width=1024, quality=80)
-        print(f"[D Stage1] {len(compressed)//1024}KB  g={g1}")
-        client = _get_vertex_client()
-
-        r1 = client.models.edit_image(
+        resp = client.models.edit_image(
             model="imagen-3.0-capability-001",
-            prompt=p1,
+            prompt=prompt,
             reference_images=[genai_types.RawReferenceImage(
                 reference_id=1,
                 reference_image=genai_types.Image(image_bytes=compressed),
             )],
             config=genai_types.EditImageConfig(
-                edit_mode="EDIT_MODE_DEFAULT", number_of_images=1,
-                guidance_scale=float(g1),
-                negative_prompt=(
-                    "furniture, objects, clutter, distorted architecture, "
-                    "watermark, low quality, unrealistic"
-                ),
+                edit_mode="EDIT_MODE_DEFAULT",
+                number_of_images=1,
+                guidance_scale=float(guidance),
+                negative_prompt=negative or None,
                 safety_filter_level="block_only_high",
             ),
         )
-        s1 = r1.generated_images[0].image.image_bytes if r1.generated_images \
-             else compress_image(photo_bytes, max_width=1024, quality=80)
-        print(f"[D Stage1] {'OK' if r1.generated_images else 'fallback'} → Stage2 g={g2}")
-
-        r2 = client.models.edit_image(
-            model="imagen-3.0-capability-001",
-            prompt=p2,
-            reference_images=[genai_types.RawReferenceImage(
-                reference_id=1, reference_image=genai_types.Image(image_bytes=s1),
-            )],
-            config=genai_types.EditImageConfig(
-                edit_mode="EDIT_MODE_DEFAULT", number_of_images=1,
-                guidance_scale=float(g2),
-                negative_prompt=(
-                    "empty room, bare walls, clutter, cartoon, flat lighting, "
-                    "floating objects, sticker effect, inconsistent shadows, "
-                    "distorted architecture, watermark, low quality"
-                ),
-                safety_filter_level="block_only_high",
-            ),
-        )
-        if r2.generated_images:
-            print("[D Stage2] SUCCESS")
-            return base64.b64encode(r2.generated_images[0].image.image_bytes).decode()
-        print(f"[D Stage2] 0 immagini")
+        if resp.generated_images:
+            return resp.generated_images[0].image.image_bytes
+        # Log prompt per debug quando 0 immagini
+        print(f"[{label}] 0 immagini (g={guidance}) — prompt[:150]: {prompt[:150]!r}")
         return None
     except Exception as e:
-        print(f"[D] ERRORE: {e}\n{traceback.format_exc()}")
+        print(f"[{label}] ERRORE: {type(e).__name__}: {e}")
+        print(f"[{label}] prompt[:150]: {prompt[:150]!r}")
         return None
 
 
-# ── E two-stage (Wall Force + Kitchen) ───────────────────────────────────────
+def _approach_two_stage(photo_bytes: bytes,
+                        p1: str, p2: str,
+                        g1: int, g2: int,
+                        label: str,
+                        current_wall_color: str = "",
+                        is_kitchen: bool = False) -> str | None:
+    compressed = compress_image(photo_bytes, max_width=1024, quality=80)
+    print(f"[{label} S1] {len(compressed)//1024}KB g={g1}")
 
-def _approach_E_two_stage(photo_bytes: bytes,
-                           p1: str, p2: str,
-                           g1: int, g2: int,
-                           current_wall_color: str = "",
-                           is_kitchen: bool = False) -> str | None:
-    try:
-        compressed = compress_image(photo_bytes, max_width=1024, quality=80)
-        label = "E[kitchen]" if is_kitchen else "E[room]"
-        print(f"[{label} Stage1] {len(compressed)//1024}KB  g={g1}")
-        client = _get_vertex_client()
-
-        neg1 = (
-            "furniture, objects, clutter, distorted architecture, watermark, low quality, "
-            "original wall color, bleed-through, transparent paint, "
-            "previous color showing through, dirty walls"
-        )
+    # Negative prompts — corti e focalizzati
+    neg1 = "distorted architecture, watermark, low quality, unrealistic"
+    if label == "E":
+        neg1 += ", original wall color, bleed-through"
         if current_wall_color:
-            neg1 += f", {current_wall_color} tint on walls"
+            neg1 += f", {current_wall_color} walls"
         if is_kitchen:
-            neg1 += ", beige cabinets, cream cabinets, old cabinet finish, original cabinet color"
+            neg1 += ", old cabinet color, beige cabinets"
 
-        r1 = client.models.edit_image(
-            model="imagen-3.0-capability-001",
-            prompt=p1,
-            reference_images=[genai_types.RawReferenceImage(
-                reference_id=1,
-                reference_image=genai_types.Image(image_bytes=compressed),
-            )],
-            config=genai_types.EditImageConfig(
-                edit_mode="EDIT_MODE_DEFAULT", number_of_images=1,
-                guidance_scale=float(g1),
-                negative_prompt=neg1,
-                safety_filter_level="block_only_high",
-            ),
-        )
-        s1 = r1.generated_images[0].image.image_bytes if r1.generated_images \
-             else compress_image(photo_bytes, max_width=1024, quality=80)
-        print(f"[{label} Stage1] {'OK' if r1.generated_images else 'fallback'} → Stage2 g={g2}")
+    s1 = _call_imagen(f"{label}S1", compressed, p1, g1, neg1)
+    if not s1:
+        print(f"[{label} S1] fallback su originale")
+        s1 = compressed
+    else:
+        print(f"[{label} S1] OK → S2 g={g2}")
 
-        neg2 = (
-            "empty room, bare walls, clutter, cartoon, flat lighting, floating objects, "
-            "sticker effect, inconsistent shadows, distorted architecture, watermark, "
-            "original wall color retained, bleed-through, yellowish tint"
-        )
+    neg2 = "empty room, bare walls, cartoon, flat lighting, floating objects, watermark"
+    if label == "E":
+        neg2 += ", original wall color retained, bleed-through"
         if current_wall_color:
-            neg2 += f", {current_wall_color} on walls"
+            neg2 += f", {current_wall_color}"
         if is_kitchen:
-            neg2 += ", beige cabinets, old cabinet color, original kitchen appearance"
+            neg2 += ", old cabinet color"
 
-        r2 = client.models.edit_image(
-            model="imagen-3.0-capability-001",
-            prompt=p2,
-            reference_images=[genai_types.RawReferenceImage(
-                reference_id=1, reference_image=genai_types.Image(image_bytes=s1),
-            )],
-            config=genai_types.EditImageConfig(
-                edit_mode="EDIT_MODE_DEFAULT", number_of_images=1,
-                guidance_scale=float(g2),
-                negative_prompt=neg2,
-                safety_filter_level="block_only_high",
-            ),
-        )
-        if r2.generated_images:
-            print(f"[{label} Stage2] SUCCESS")
-            return base64.b64encode(r2.generated_images[0].image.image_bytes).decode()
-        print(f"[{label} Stage2] 0 immagini")
-        return None
-    except Exception as e:
-        print(f"[E] ERRORE: {e}\n{traceback.format_exc()}")
-        return None
+    s2 = _call_imagen(f"{label}S2", s1, p2, g2, neg2)
+    if s2:
+        print(f"[{label} S2] SUCCESS")
+        return base64.b64encode(s2).decode()
+    return None
+
+
+def _approach_outdoor(photo_bytes: bytes,
+                      p1: str, p2: str,
+                      g1: int, g2: int) -> str | None:
+    """Template outdoor: preserva cielo e vista, aggiunge solo arredo esterno."""
+    compressed = compress_image(photo_bytes, max_width=1024, quality=80)
+    print(f"[OUTDOOR S1] {len(compressed)//1024}KB g={g1}")
+
+    neg_outdoor = (
+        "interior walls added, enclosed space, ceiling added over balcony, "
+        "sky removed, view blocked, distorted architecture, watermark, low quality"
+    )
+
+    s1 = _call_imagen("OUTDOOR_S1", compressed, p1, g1, neg_outdoor)
+    if not s1:
+        s1 = compressed
+        print("[OUTDOOR S1] fallback su originale")
+    else:
+        print("[OUTDOOR S1] OK → S2")
+
+    neg2_outdoor = neg_outdoor + ", clutter, drying rack, messy objects"
+    s2 = _call_imagen("OUTDOOR_S2", s1, p2, g2, neg2_outdoor)
+    if s2:
+        print("[OUTDOOR S2] SUCCESS")
+        return base64.b64encode(s2).decode()
+    return None
