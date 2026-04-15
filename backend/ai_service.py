@@ -142,6 +142,25 @@ def _extract_json(text: str) -> dict:
     return json.loads(text[start:end])
 
 
+async def validate_input_photos(photos: list) -> dict:
+    """
+    Stub di compatibilità — la versione completa è nelle v18+.
+    Restituisce tutte le foto come valide senza chiamare Gemini.
+    """
+    n = len(photos)
+    return {
+        "valid":       [True] * n,
+        "issues":      ["ok"] * n,
+        "room_types":  ["unknown"] * n,
+        "is_outdoor":  [False] * n,
+        "suggestions": [""] * n,
+        "structural":  [[] for _ in range(n)],
+        "warnings":    [],
+        "layout_hint": "",
+        "all_valid":   True,
+    }
+
+
 def validate_and_fix_costs(analysis: dict, budget: int) -> dict:
     stanze = analysis.get("stanze", [])
     rc     = analysis.setdefault("riepilogo_costi", {})
