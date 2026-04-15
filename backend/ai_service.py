@@ -388,7 +388,6 @@ async def analyze_with_gemini(photos: list, prefs: dict) -> dict:
         return _analysis_cache[key]
     loop   = asyncio.get_running_loop()
     result = await loop.run_in_executor(_gemini_executor, _gemini_sync, photos, prefs)
-    result = _validate_stanze_count(result, len(photos))
     result = _sync_furniture_costs(result, _get_palette(prefs.get("style", "")))
     result = validate_and_fix_costs(result, prefs["budget"])
     # Inietta stile nei metadata per recupero in generate_staged_photos
@@ -530,7 +529,15 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
     resp.raise_for_status()
     text   = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
     result = _extract_json(text)
-    print(f"[Gemini] stanze={len(result.get('stanze',[]))}/{n}  "
+    # Inline: correggi indici stanza fuori range
+    stanze = result.get("stanze", [])
+    if len(stanze) != n:
+        print(f"[WARNING] Gemini: {len(stanze)} stanze vs {n} foto")
+    for i, room in enumerate(stanze):
+        idx = room.get("indice_foto")
+        if idx is None or not isinstance(idx, int) or idx >= n:
+            room["indice_foto"] = i
+    print(f"[Gemini] stanze={len(stanze)}/{n}  "
           f"wall_color_global={result.get('wall_color_global','?')!r}")
     return result
 
