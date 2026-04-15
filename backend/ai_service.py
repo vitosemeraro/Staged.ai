@@ -49,7 +49,7 @@ GEMINI_URL = (
 GUIDANCE = {
     "D_STAGE1_CLEAN":   8,    # libertà massima per pulizia
     "D_STAGE2_STAGE":  10,    # layering moderato
-    "E_STAGE1_WALL":   14,    # aggressivo sul colore (max sicuro)
+    "E_STAGE1_WALL":   15,    # alzato a 15: forza cambio colore pareti
     "E_STAGE2_STAGE":  10,    # mantiene pareti, aggiunge arredo
     "OUTDOOR_STAGE1":   6,    # molto libero per spazi aperti
     "OUTDOOR_STAGE2":   8,    # aggiunge arredi esterni
@@ -315,7 +315,58 @@ def validate_and_fix_costs(analysis: dict, budget: int) -> dict:
     return analysis
 
 
-def _validate_stanze_count(analysis: dict, n_photos: int) -> dict:
+def _sync_furniture_costs(analysis: dict, palette: dict) -> dict:
+    """
+    Allinea furniture_to_replace → interventi.
+    Se Gemini ha messo un mobile in furniture_to_replace ma non ha
+    un intervento corrispondente nel PDF, lo inietta automaticamente.
+    Questo evita la discrepanza armadio-fantasma (visto nel render, non nel preventivo).
+    """
+    for room in analysis.get("stanze", []):
+        replacements = room.get("furniture_to_replace") or []
+        interventi   = room.get("interventi") or []
+        # Testo degli interventi esistenti in minuscolo per confronto
+        existing_text = " ".join(
+            (iv.get("titolo", "") + " " + iv.get("dettaglio", "")).lower()
+            for iv in interventi
+        )
+        for r in replacements:
+            parts = r.split("|")
+            if len(parts) < 2:
+                continue
+            old_item = parts[0].strip()
+            new_item = parts[1].strip()
+            # Controlla se è già menzionato negli interventi
+            if old_item.lower() in existing_text or new_item.lower() in existing_text:
+                continue
+            # Stima costo grezzo basata sul tipo di mobile
+            costo = 150  # default
+            ol = old_item.lower()
+            if any(k in ol for k in ("wardrobe", "armadio", "closet")):
+                costo = 300
+            elif any(k in ol for k in ("sofa", "divano", "couch")):
+                costo = 250
+            elif any(k in ol for k in ("bed", "letto")):
+                costo = 200
+            elif any(k in ol for k in ("table", "tavolo", "desk")):
+                costo = 120
+            elif any(k in ol for k in ("chair", "sedia")):
+                costo = 60
+            interventi.append({
+                "titolo":       f"Sostituzione {old_item}",
+                "dettaglio":    f"Sostituire {old_item} con {new_item} in {palette['wood']}",
+                "costo_min":    int(costo * 0.8),
+                "costo_max":    costo,
+                "priorita":     "alta",
+                "dove_comprare":"IKEA, JYSK",
+            })
+            room["costo_totale_stanza"] = room.get("costo_totale_stanza", 0) + costo
+            print(f"[sync_costs] stanza '{room.get('nome','?')}': "
+                  f"aggiunto intervento '{old_item}' €{int(costo*0.8)}–{costo}")
+        room["interventi"] = interventi
+    return analysis
+
+
     stanze = analysis.get("stanze", [])
     if len(stanze) != n_photos:
         print(f"[WARNING] Gemini: {len(stanze)} stanze vs {n_photos} foto")
@@ -338,6 +389,7 @@ async def analyze_with_gemini(photos: list, prefs: dict) -> dict:
     loop   = asyncio.get_running_loop()
     result = await loop.run_in_executor(_gemini_executor, _gemini_sync, photos, prefs)
     result = _validate_stanze_count(result, len(photos))
+    result = _sync_furniture_costs(result, _get_palette(prefs.get("style", "")))
     result = validate_and_fix_costs(result, prefs["budget"])
     # Inietta stile nei metadata per recupero in generate_staged_photos
     result["_prefs_style"] = prefs.get("style", "")
@@ -577,9 +629,11 @@ def _build_e_stage1(room: dict, palette: dict, wc: str, wf: str) -> str:
         )
 
     return (
-        f"Renovated room. Replace {cur} walls with {wf} {wc} paint — full coverage. "
+        f"Architectural renovation. Brutal color replacement: completely sand and repaint "
+        f"all {cur} wall surfaces with 3 coats of high-opacity {wf} {wc} paint. "
+        f"Full wall coverage, no {cur} visible anywhere, achromatic base before new color. "
         f"{kitchen_part}{sf} "
-        f"Keep {fl} floor. Remove furniture and clutter. "
+        f"Keep {fl} floor. Remove all furniture and clutter. "
         f"Light from {lt}. Photorealistic, 8k."
     )
 
@@ -620,32 +674,37 @@ def _build_e_stage2(room: dict, palette: dict, wc: str, wf: str) -> str:
 # ── Outdoor templates (balcone/terrazzo) ──────────────────────────────────────
 
 def _build_outdoor_stage1(room: dict, palette: dict) -> str:
-    """Stage 1 outdoor: rimuove ingombri, mantiene vista e pavimento."""
+    """Stage 1 outdoor: rimuove ingombri, mantiene cielo e vista, ripristina ringhiera."""
     fl   = room.get("outdoor_floor") or room.get("floor_material", "existing floor tiles")
     view = room.get("outdoor_view", "city view")
+    metal = palette.get("metal", "Matte Black")
     return (
         f"Outdoor balcony staging. "
-        f"Keep original sky, city view ({view}), and exterior building elements unchanged. "
-        f"Remove clutter: drying racks, old furniture, scattered objects. "
-        f"Keep {fl} floor clean. "
-        f"No walls added — this is an open outdoor space. "
+        f"Maintain 100% of the original sky and background {view} — do not alter sky or horizon. "
+        f"Remove only: drying racks, old furniture, scattered objects, laundry. "
+        f"Keep {fl} floor tiles unchanged. "
+        f"Restore and clean all metal railings and balustrades — repaint with fresh {metal} finish, "
+        f"remove rust and imperfections from railings. "
+        f"This is an open exterior space — no walls, no ceiling, no indoor elements. "
         f"Bright natural daylight. Photorealistic exterior photo, 8k."
     )
 
 
 def _build_outdoor_stage2(room: dict, palette: dict) -> str:
-    """Stage 2 outdoor: aggiunge arredo da esterno."""
+    """Stage 2 outdoor: aggiunge arredo esterno su spazio ripristinato."""
     layer = ", ".join((room.get("layering_add") or [])[:4]) or \
-            "folding table, 2 chairs, potted plants, outdoor rug"
-    fl    = room.get("outdoor_floor") or room.get("floor_material", "existing floor")
+            "2 folding chairs, small round table, potted plants, outdoor rug"
+    fl    = room.get("outdoor_floor") or room.get("floor_material", "existing tiles")
     view  = room.get("outdoor_view", "city view")
+    metal = palette.get("metal", "Matte Black")
+    wood  = palette.get("wood", "Light Natural Wood")
     return (
-        f"Staged balcony. Keep original sky and {view}. "
-        f"Keep {fl} floor and building exterior railings unchanged. "
-        f"Add outdoor furniture: {layer}. "
-        f"Materials: {palette['wood']} and {palette['metal']}. "
-        f"Bright natural daylight, no interior walls visible. "
-        f"Professional exterior photo, wide angle, 8k."
+        f"Staged outdoor balcony. Maintain 100% original sky and {view} unchanged. "
+        f"Keep {fl} floor and freshly painted {metal} railings unchanged. "
+        f"Add tasteful outdoor furniture: {layer}. "
+        f"Furniture in {wood} and {metal}. "
+        f"No walls, no ceiling, no interior elements — purely exterior open space. "
+        f"Bright natural daylight. Professional exterior photo, wide angle, 8k."
     )
 
 
@@ -818,7 +877,8 @@ def _approach_outdoor(photo_bytes: bytes,
 
     neg_outdoor = (
         "interior walls added, enclosed space, ceiling added over balcony, "
-        "sky removed, view blocked, distorted architecture, watermark, low quality"
+        "sky removed, view blocked, distorted architecture, watermark, low quality, "
+        "indoor lighting, curtains, wallpaper, interior doors, roof added"
     )
 
     s1 = _call_imagen("OUTDOOR_S1", compressed, p1, g1, neg_outdoor)
@@ -828,7 +888,7 @@ def _approach_outdoor(photo_bytes: bytes,
     else:
         print("[OUTDOOR S1] OK → S2")
 
-    neg2_outdoor = neg_outdoor + ", clutter, drying rack, messy objects"
+    neg2_outdoor = neg_outdoor + ", clutter, drying rack, laundry, rusty railings, dirty floor"
     s2 = _call_imagen("OUTDOOR_S2", s1, p2, g2, neg2_outdoor)
     if s2:
         print("[OUTDOOR S2] SUCCESS")
