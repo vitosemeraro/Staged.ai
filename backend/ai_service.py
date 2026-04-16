@@ -1,29 +1,18 @@
 """
-AI Service v22 — E_WALL_FORCE Two-Stage "Interior Designer Engine"
+AI Service v24 — Master Stylist Engine
 
-Unica variante attiva: E_WALL_FORCE in modalità two-stage.
-D_FULL_SMART: rimosso completamente.
+Unica variante: E_WALL_FORCE two-stage. Zero librerie extra.
+Tutto il delta qualitativo è nel prompt engineering.
 
-Stage 1 — The Canvas (guidance=16):
-  Force-paint template: copre al 100% i colori originali con solid opaque coating.
-  Svuota la stanza dai mobili brutti/ingombranti. Risultato: "scatola vuota" pulita.
-
-Stage 2 — The Staging (guidance=12):
-  Catchy layering: tessili ricchi, piante (Monstera/Strelitzia), lampade 2700K,
-  quadri minimalisti. Prompt costruito da mandatory_visual_keywords generati da Gemini
-  in base agli interventi del preventivo (Cost-to-Prompt sincronizzato).
-
-Protocollo budget:
-  - budget_action = "remove": mobile brutto eliminato, parete vuota e luminosa.
-  - budget_action = "replace": rimpiazzato con modello IKEA specifico.
-  - budget_action = "reface": cucine/bagni → cambio colore ante o micro-cement.
-
-Protezione strutturale:
-  - Frigo, sanitari, docce: mai rimossi sotto €5000/stanza.
-  - Bagni: no finestre fantasma, piastrelle trattate come struttura.
-
-Chiamate Imagen: N_stanze × 2 (Stage1 + Stage2). Con 4 stanze = 8 call totali.
-Semaforo reale: max 2 task simultanei, retry 2× con backoff 15s.
+Novità v24:
+  SCENIC_CONFIG  — keyword fotografiche professionali iniettate in ogni chiamata Imagen.
+  get_style_dna  — database stili: Boho/Scandinavo/Minimalista/Japandi/Industrial/ecc.
+                   Ogni stile → palette, materiali, arredi IKEA, piante, tessili specifici.
+  Stage 1 v24    — decluttering esplicito per categoria (cavi, oggetti personali,
+                   mobili brutti identificati da Gemini), force-paint aggressivo.
+  Stage 2 v24    — Catchy Airbnb Layer fisso: cuscini stratificati, pianta statement,
+                   props scenografici (riviste design, vasi, quadri).
+                   Budget-driven: reface se budget basso, replace IKEA se budget alto.
 """
 import asyncio
 import base64
@@ -67,6 +56,91 @@ GUIDANCE = {
     "E_STAGE1_CANVAS":  16,   # Force-paint: copre colori originali al 100%
     "E_STAGE2_STAGING": 12,   # Catchy layering: fotorealismo + arredo
 }
+
+# ── SCENIC CONFIG — keyword fotografiche iniettate in ogni chiamata Imagen ────
+SCENIC_CONFIG = (
+    "24mm architectural wide-angle lens, f/11 aperture, "
+    "cinematic warm light 2700K, HDR perfectly balanced exposure, "
+    "soft bounced light from ceiling, global illumination with IES profiles, "
+    "architectural digest photography style, 8k resolution, ultra sharp"
+)
+
+# ── STYLE DNA — database stili: palette + materiali + arredi + piante ─────────
+_STYLE_DB: dict[str, dict] = {
+    "scandinavo": {
+        "palette":    "warm white walls, light ash wood tones, soft grey accents",
+        "materials":  "light oak, white-painted wood, linen, wool, natural stone",
+        "furniture":  "IKEA MALM bed white, IKEA LISABO table ash, IKEA ADDE chairs white",
+        "textiles":   "chunky knit throw in cream, linen cushions in dusty blue and oat",
+        "plants":     "Monstera deliciosa in light grey ceramic pot",
+        "props":      "white ceramic vases, minimalist wooden clock, simple framed prints",
+        "lighting":   "IKEA REGOLIT pendant lamp, warm Edison bulb 2700K",
+    },
+    "minimalista": {
+        "palette":    "pure white walls, warm grey accents, black steel details",
+        "materials":  "concrete, white-painted plaster, polished stone, black metal",
+        "furniture":  "IKEA MALM dresser black-brown, IKEA LACK side table white, low-profile sofa",
+        "textiles":   "white linen bedding, single grey throw, no pattern cushions",
+        "plants":     "tall Sansevieria in matte black pot",
+        "props":      "single large art print black frame, architectural coffee table book",
+        "lighting":   "IKEA HEKTAR floor lamp black, directional spotlight 2700K",
+    },
+    "japandi": {
+        "palette":    "warm greige walls, natural wood, muted earth tones, wabi-sabi accents",
+        "materials":  "bamboo, rattan, rice paper, unfinished wood, linen, ceramic",
+        "furniture":  "low platform bed natural wood, rattan side table, floor cushion zabuton",
+        "textiles":   "linen duvet in oat, woven cotton blanket in terracotta, no pattern",
+        "plants":     "Bonsai tree or tall Bamboo in terracotta pot",
+        "props":      "ceramic tea set, single dried pampas stem, zen rock garden tray",
+        "lighting":   "paper lantern pendant MUJI style, warm 2200K candle light",
+    },
+    "boho": {
+        "palette":    "warm white walls, terracotta accents, sage green, mustard yellow",
+        "materials":  "jute, rattan, macramé, distressed wood, ethnic textiles",
+        "furniture":  "rattan armchair, low wooden coffee table, IKEA LOHALS jute rug",
+        "textiles":   "mix of patterned cushions (ethnic, ikat, velvet), fringed throw in mustard",
+        "plants":     "Strelitzia nicolai or large Fiddle-leaf fig in terracotta pot",
+        "props":      "macramé wall hanging, vintage ceramic vases, ethnic woven basket",
+        "lighting":   "rattan pendant lamp, string fairy lights warm 2200K",
+    },
+    "industrial": {
+        "palette":    "exposed concrete grey, dark charcoal walls, warm amber accents",
+        "materials":  "raw steel, reclaimed wood, exposed brick, leather, concrete",
+        "furniture":  "IKEA FJÄLLBO shelving black steel, leather sofa dark brown, metal bar stools",
+        "textiles":   "dark grey wool throw, leather cushions, no pattern",
+        "plants":     "large Cactus or Rubber plant in raw concrete pot",
+        "props":      "vintage Edison bulb pendant, industrial clock, reclaimed wood shelf",
+        "lighting":   "IKEA HEKTAR pendant black, exposed Edison bulb 2200K warm amber",
+    },
+    "mediterraneo": {
+        "palette":    "warm white walls, cobalt blue accents, terracotta floors, ochre",
+        "materials":  "whitewashed plaster, terracotta tiles, wrought iron, ceramic",
+        "furniture":  "whitewashed wood furniture, wrought iron bed frame, ceramic tile table",
+        "textiles":   "white cotton bedding, blue and white striped cushions, linen curtains",
+        "plants":     "Olive tree in large terracotta pot, Lavender, Bougainvillea",
+        "props":      "blue ceramic vases, woven baskets, hand-painted ceramic plates on wall",
+        "lighting":   "wrought iron pendant, warm 2700K candlelight lanterns",
+    },
+}
+
+def get_style_dna(style: str) -> dict:
+    """
+    Restituisce il dizionario DNA per lo stile richiesto.
+    Fuzzy match: cerca la keyword dello stile nel database.
+    Fallback: minimalista.
+    """
+    style_lower = style.lower()
+    # Exact match
+    if style_lower in _STYLE_DB:
+        return _STYLE_DB[style_lower]
+    # Fuzzy: cerca se una chiave è contenuta nello stile scritto dall'utente
+    for key in _STYLE_DB:
+        if key in style_lower or style_lower in key:
+            return _STYLE_DB[key]
+    # Fallback
+    return _STYLE_DB["minimalista"]
+
+
 
 _vertex_client = None
 
@@ -440,9 +514,28 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         }
     }
 
-    response = httpx.post(GEMINI_URL, json=payload, timeout=180.0,
-                          headers={"Content-Type": "application/json"})
-    response.raise_for_status()
+    import time
+
+    for attempt in range(1, 4):  # max 3 tentativi
+        try:
+            response = httpx.post(GEMINI_URL, json=payload, timeout=180.0,
+                                  headers={"Content-Type": "application/json"})
+            response.raise_for_status()
+            break  # successo — esci dal loop
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            if status in (429, 500, 502, 503, 504) and attempt < 3:
+                wait = 20 * attempt  # 20s, poi 40s
+                print(f"[Gemini] HTTP {status} attempt={attempt} — retry tra {wait}s…")
+                time.sleep(wait)
+            else:
+                raise  # rilancia dopo 3 tentativi o su errori non retriable (es. 400, 401)
+        except httpx.TimeoutException:
+            if attempt < 3:
+                print(f"[Gemini] timeout attempt={attempt} — retry tra 30s…")
+                time.sleep(30)
+            else:
+                raise
 
     data = response.json()
     text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -453,10 +546,14 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
 
 # ── STAGED PHOTOS ─────────────────────────────────────────────────────────────
 
-async def generate_staged_photos(photos: list, analysis: dict) -> list:
+async def generate_staged_photos(photos: list, analysis: dict,
+                                  prefs: dict | None = None) -> list:
     stanze  = analysis.get("stanze", [])
     results = [{} for _ in stanze]
     sem     = _get_semaphore()
+    budget  = (prefs or {}).get("budget", 3000)
+    style   = (prefs or {}).get("style", "minimalista")
+    style_dna = get_style_dna(style)
 
     async def _run_room(i: int, room: dict):
         idx         = room.get("indice_foto", i)
@@ -464,30 +561,34 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
         if not photo_bytes:
             return
 
-        is_bathroom  = room.get("is_bathroom", False) or \
-                       room.get("room_type", "").lower() in ("bagno", "bathroom")
-        cwc          = room.get("current_wall_color", "")
-        fpc          = room.get("force_paint_color", "warm white matte")
-        fpf          = room.get("force_paint_finish", "matte")
-        floor        = room.get("floor_description", "existing floor, clean")
-        light        = room.get("light_source", "natural daylight from window")
-        spatial      = room.get("spatial_map", "")
-        keywords     = room.get("mandatory_visual_keywords", [])
+        is_bathroom = room.get("is_bathroom", False) or \
+                      room.get("room_type", "").lower() in ("bagno", "bathroom")
+        cwc         = room.get("current_wall_color", "")
+        fpc         = room.get("force_paint_color", style_dna.get("palette", "").split(",")[0].strip() or "warm white")
+        fpf         = room.get("force_paint_finish", "matte")
+        floor       = room.get("floor_description", "existing floor, clean")
+        light       = room.get("light_source", "natural daylight from window")
+        spatial     = room.get("spatial_map", "")
+        keywords    = room.get("mandatory_visual_keywords", [])
+        detected    = room.get("detected_elements", [])
 
-        # ── Cerca esperimento E_WALL_FORCE nel JSON Gemini ───────────────────
         esp = next(
             (e for e in room.get("esperimenti_staged", []) if e.get("logic_id") == "E_WALL_FORCE"),
             {}
         )
 
-        # ── Build Stage 1: Force-Paint Canvas ────────────────────────────────
-        # Usa il prompt di Gemini come base; Python sovrascrive le sezioni critiche
-        s1_base = esp.get("prompt_stage1", "")
-        stage1_prompt = _build_stage1_prompt(s1_base, cwc, fpc, fpf, floor, light, is_bathroom)
-
-        # ── Build Stage 2: Catchy Layering ────────────────────────────────────
-        s2_base = esp.get("prompt_stage2", "")
-        stage2_prompt = _build_stage2_prompt(s2_base, fpc, fpf, keywords, spatial, is_bathroom)
+        stage1_prompt = _build_stage1_prompt(
+            esp.get("prompt_stage1", ""),
+            cwc, fpc, fpf, floor, light, is_bathroom,
+            detected_elements=detected,
+            style_dna=style_dna,
+        )
+        stage2_prompt = _build_stage2_prompt(
+            esp.get("prompt_stage2", ""),
+            fpc, fpf, keywords, spatial, is_bathroom,
+            style_dna=style_dna,
+            budget=budget,
+        )
 
         loop = asyncio.get_running_loop()
         async with sem:
@@ -502,101 +603,142 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
 
 
 def _build_stage1_prompt(base: str, cwc: str, fpc: str, fpf: str,
-                          floor: str, light: str, is_bathroom: bool) -> str:
+                          floor: str, light: str, is_bathroom: bool,
+                          detected_elements: list | None = None,
+                          style_dna: dict | None = None) -> str:
     """
-    Force-Paint Canvas: svuota la stanza e ridipinge le pareti.
-    La keyword critica 'solid opaque [color] [finish] paint' è sempre presente.
+    Stage 1 v24 — The Canvas:
+    Decluttering esplicito per categoria + force-paint aggressivo.
     """
+    dna = style_dna or {}
+
+    # ── Force-paint: copre al 100% il colore originale ───────────────────────
+    paint_target = fpc or (dna.get("palette", "").split(",")[0].strip()) or "warm white"
+    paint_finish = fpf or "matte"
     paint_cmd = (
-        f"The original {cwc} walls are now completely covered with "
-        f"solid opaque {fpc} {fpf} paint. "
-        if cwc else
-        f"All walls are now solid opaque {fpc} {fpf} paint. "
+        f"WALL TRANSFORMATION: The original {cwc} colored walls are now "
+        if cwc else "WALL TRANSFORMATION: All walls are now "
     )
-    paint_cmd += "Zero bleed-through. 100% opacity. No original color visible anywhere. "
+    paint_cmd += (
+        f"completely covered with solid high-opacity {paint_target} {paint_finish} paint. "
+        "Zero bleed-through. Zero transparency. 100% solid coverage. "
+        f"No trace of any previous color. Freshly painted {paint_target} surfaces. "
+    )
 
+    # ── Decluttering esplicito per categoria ─────────────────────────────────
     if is_bathroom:
-        # Bagni: no rimozione piastrelle, no finestre fantasma
-        room_cmd = (
-            "BATHROOM: Keep original tile layout and boundaries. "
-            "Recolor tiles with micro-cement white finish overlay. "
-            "Remove only portable objects (soap, bottles, mats). "
-            "DO NOT add windows not present in original. "
+        declutter = (
+            "BATHROOM PROTOCOL: Keep all tile boundaries and structural elements. "
+            "Remove only portable items: soap bottles, shampoo, bath mats, toothbrushes, "
+            "personal objects, towels on floor. "
+            "Recolor tiles with micro-cement white matte overlay (keep tile grid lines). "
+            "DO NOT add windows not visible in original photo. "
         )
+        materials_cmd = f"Floor: {floor}. Ceiling: white. "
     else:
-        room_cmd = (
-            "Remove all furniture, clutter, and obsolete objects. "
-            "Keep built-in elements (windows, doors, built-in wardrobes if modern). "
+        # Lista oggetti da rimuovere basata su detected_elements di Gemini
+        ugly_items = ""
+        if detected_elements:
+            targets = [e for e in detected_elements if any(
+                bad in e.lower() for bad in [
+                    "old", "datato", "brutto", "ingombrante", "obsoleto",
+                    "spazzatura", "cavo", "filo", "sacco", "bag", "clutter",
+                    "disordinato", "personali", "oggetti", "scaffale metallico",
+                ]
+            )]
+            if targets:
+                ugly_items = "Remove specifically: " + ", ".join(targets[:6]) + ". "
+
+        declutter = (
+            "DECLUTTERING: Remove ALL furniture and objects. "
+            "Explicitly remove: electrical cables, personal items, trash bags, "
+            "old bulky wardrobes, dated curtains, obsolete electronics, "
+            "decorative clutter, photo frames on surfaces. "
+            + ugly_items +
+            "Keep ONLY: fixed architecture (windows, doors, built-in modern wardrobes). "
+            "Result: bright empty room with clean sightlines. "
+        )
+        materials_cmd = (
+            f"Floor: {floor}, swept and clean. "
+            f"Ceiling: white, clean. "
         )
 
-    floor_cmd = f"Floor: {floor}, swept clean. "
-    light_cmd = f"Lighting: {light}, consistent, no harsh shadows. "
-    end_cmd   = "Empty room. Photorealistic, 8k resolution."
+    # ── Luce e qualità ────────────────────────────────────────────────────────
+    light_cmd = f"Natural light from {light}. No harsh shadows. Evenly lit. "
+    end_cmd   = f"Empty architectural shell. {SCENIC_CONFIG}."
 
-    # Se Gemini ha generato un prompt base sensato, usalo come punto di partenza
-    # ma sovrascriviamo sempre la sezione pittura con il nostro template forzato
-    if base and len(base) > 30:
-        # Rimuovi eventuali istruzioni di arredo dal prompt Stage1 di Gemini
-        # (a volte Gemini mette mobili anche nello Stage1)
-        clean_base = base.split("Add:")[0].split("Place:")[0].strip().rstrip(",") + ". "
-        return paint_cmd + room_cmd + floor_cmd + light_cmd + clean_base + end_cmd
-    return paint_cmd + room_cmd + floor_cmd + light_cmd + end_cmd
+    return paint_cmd + declutter + materials_cmd + light_cmd + end_cmd
 
 
 def _build_stage2_prompt(base: str, fpc: str, fpf: str,
-                          keywords: list, spatial: str, is_bathroom: bool) -> str:
+                          keywords: list, spatial: str, is_bathroom: bool,
+                          style_dna: dict | None = None,
+                          budget: int = 3000) -> str:
     """
-    Catchy Layering: arreda la scatola pulita con gli elementi del preventivo.
-    mandatory_visual_keywords → primo blocco del prompt.
-    Catchy layering fisso: cuscini, pianta, lampada, quadro.
-    Chiude sempre con: professional real estate photography formula.
+    Stage 2 v24 — Catchy Airbnb Staging:
+    Combina mandatory_visual_keywords (dal preventivo) con Catchy Layer fisso
+    e Style DNA. Budget-driven: reface se basso, replace IKEA se alto.
     """
-    # Conferma pareti (anchora Stage2 al risultato di Stage1)
+    dna = style_dna or {}
+    paint_target = fpc or "warm white"
+
+    # ── Conferma pareti dallo Stage 1 (ancora il modello) ────────────────────
     wall_confirm = (
-        f"The room has fresh {fpc} {fpf} painted walls from the renovation. "
-        f"These walls show no trace of any previous color. "
+        f"This room has fresh {paint_target} {fpf} painted walls. "
+        "Walls are perfectly clean with zero traces of previous colors. "
     )
 
-    # Keyword dal preventivo (Cost-to-Prompt)
+    # ── Mandatory keywords dal preventivo (Cost-to-Prompt) ───────────────────
     kw_block = ""
     if keywords:
-        kw_block = " ".join(keywords) + ". "
+        kw_block = "BUDGET INTERVENTIONS TO VISUALIZE: " + ". ".join(keywords) + ". "
 
-    # Spatial map
-    spatial_block = f"{spatial}. " if spatial else ""
+    # ── Spatial map (evita mobili che bloccano elementi fissi) ───────────────
+    spatial_block = f"SPATIAL LAYOUT: {spatial}. " if spatial else ""
 
-    # Catchy layering fisso
-    if is_bathroom:
-        layering = (
-            "Add: IKEA GODMORGON white floating vanity with integrated sink. "
-            "Large rectangular mirror with thin frame above. "
-            "Rolled white towels on shelf. Small succulent plant in white pot. "
-            "Minimal matte black accessories (soap dispenser, towel ring). "
+    # ── Budget-driven logic ───────────────────────────────────────────────────
+    if budget < 3000:
+        budget_directive = (
+            "BUDGET MODE — REFACE: Keep existing furniture structure. "
+            "Recolor surfaces: paint cabinet doors white, apply adhesive film. "
+            "Focus on accessories and textiles to refresh the look. "
         )
     else:
-        layering = (
-            "Layering: 5 textured cushions mix (linen, velvet, bouclé) on sofa. "
-            "Statement plant — Monstera deliciosa or Strelitzia in large ceramic pot. "
-            "Warm 2700K floor lamp with black metal stem. "
-            "Two minimalist framed art prints on wall. "
-            "Natural fiber rug (jute or wool) anchoring the seating area. "
+        furniture = dna.get("furniture", "modern IKEA furniture, clean lines")
+        budget_directive = (
+            f"FULL STAGING MODE: Add new furniture — {furniture}. "
+            "Replace dated pieces with clean modern equivalents. "
         )
 
-    end_cmd = (
-        "professional real estate photography, 24mm wide angle lens, "
-        "HDR, perfectly balanced exposure, soft natural light, "
-        "global illumination, consistent shadows, architectural digest style."
-    )
+    # ── Catchy Airbnb Layer (fisso, sempre presente) ─────────────────────────
+    if is_bathroom:
+        catchy = (
+            "BATHROOM STAGING: Add IKEA GODMORGON white floating vanity. "
+            "Large rectangular frameless mirror. "
+            "Neatly rolled white towels stacked on shelf. "
+            "Small succulent plant in white ceramic pot. "
+            "Matte black minimalist accessories (soap dispenser, towel ring, toilet brush). "
+            "Scented candle on vanity edge. "
+        )
+    else:
+        textiles  = dna.get("textiles",  "linen cushions, soft throw blanket")
+        plants    = dna.get("plants",    "Monstera deliciosa in ceramic pot")
+        props     = dna.get("props",     "design magazine, ceramic vase, minimalist art print")
+        lighting  = dna.get("lighting",  "warm floor lamp 2700K")
+        catchy = (
+            "CATCHY AIRBNB LAYER — ADD ALL OF THESE: "
+            f"Textiles: {textiles}, minimum 4 cushions with mixed textures (linen, velvet, bouclé). "
+            f"Statement plant: {plants}, positioned in corner or beside sofa. "
+            f"Props: {props}, neatly arranged on table surface. "
+            f"Lighting: {lighting}, switched on creating warm ambient glow. "
+            "Natural fiber rug anchoring the seating zone. "
+            "Everything styled for a magazine photoshoot. "
+        )
 
-    # Se Gemini ha un prompt Stage2 base, prendi solo la parte degli arredi specifici
-    extra = ""
-    if base and len(base) > 30:
-        # Estrai solo la parte degli arredi (prima delle keyword di fotografia)
-        clean = base.split("professional real estate")[0].strip().rstrip(",") + ". "
-        # Evita duplicazione con keywords già incluse
-        extra = clean if len(clean) > 30 else ""
+    end_cmd = f"Scene is fully styled and photoshoot-ready. {SCENIC_CONFIG}."
 
-    return wall_confirm + kw_block + spatial_block + extra + layering + end_cmd
+    return wall_confirm + kw_block + spatial_block + budget_directive + catchy + end_cmd
+
 
 
 
