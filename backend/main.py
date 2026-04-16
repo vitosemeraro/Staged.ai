@@ -163,7 +163,7 @@ async def _process_job(job_id: str, photos: list, prefs: dict, email: str):
         analysis = await analyze_with_gemini(photos, prefs)
 
         update(35, "Imagen 3 genera D + E (KitchenBrutalistProtocol attivo)…")
-        staged_results = await generate_staged_photos(photos, analysis)
+        staged_results = await generate_staged_photos(photos, analysis, prefs)
 
         update(80, "Generazione PDF…")
         pdf_bytes = generate_pdf(analysis, prefs, photos, staged_results=staged_results)
