@@ -26,6 +26,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Aggiunge CORS anche alle risposte di errore (500, 422 ecc.)
+# Necessario per chiamate da file:// dove l'origin è "null"
+@app.middleware("http")
+async def force_cors(request, call_next):
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request, exc):
+    from fastapi.responses import JSONResponse
+    import traceback
+    tb = traceback.format_exc()
+    print(f"[unhandled] {tb}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"{type(exc).__name__}: {exc}"},
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
 jobs: dict = {}
 
 
@@ -162,12 +184,17 @@ async def stage_image(req: StageImageRequest):
 
     from ai_service import _approach_C_edit
     loop = asyncio.get_running_loop()
-    result_b64 = await loop.run_in_executor(
-        None, _approach_C_edit, photo_bytes, req.prompt, 26, "DEMO"
-    )
+    try:
+        result_b64 = await loop.run_in_executor(
+            None, _approach_C_edit, photo_bytes, req.prompt, 26, "DEMO"
+        )
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[stage-image] ERRORE:\n{tb}")
+        raise HTTPException(status_code=500, detail=f"Errore Imagen: {type(e).__name__}: {e}")
 
     if not result_b64:
-        raise HTTPException(status_code=500, detail="Generazione immagine fallita — controlla i log Cloud Run")
+        raise HTTPException(status_code=500, detail="Imagen ha restituito 0 immagini — controlla i log Cloud Run")
 
     return {"image_b64": result_b64}
 
