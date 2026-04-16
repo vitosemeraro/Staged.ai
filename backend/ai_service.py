@@ -1,22 +1,17 @@
 """
-AI Service v17 — D_FULL_SMART + E_WALL_FORCE (two-stage)
+AI Service v21 — E_WALL_FORCE single-stage
 
-Varianti prodotte:
-  D_FULL_SMART  (Stage1 g=8,  Stage2 g=10): layering su stanza pulita — INVARIATA
-  E_WALL_FORCE  (Stage1 g=14, Stage2 g=10): come D ma Stage1 più aggressivo
-      per forzare il cambio colore pareti:
-      - Nomina esplicitamente il colore attuale da eliminare
-      - Aggiunge "Solid, opaque paint, no transparency, no bleed-through"
-      - Negative Stage1 specifico: "original wall color, bleed-through,
-        yellowish tint, previous paint color showing through"
-      - Stage2 apre confermando le nuove pareti prima di aggiungere arredo
+Architettura:
+  - D_FULL_SMART: DISABILITATO (riattivare rimuovendo il 'continue')
+  - E_WALL_FORCE: single-stage, 1 chiamata per stanza (4 stanze = 4 call totali)
+      guidance=15, solid opaque coating, protezione bagni anti-finestre-fantasma
 
-Ereditato da v16:
-  - Chain-of-Thought visual analysis (light_analysis)
-  - Keyword fotorealismo (consistent shadows, global illumination, etc.)
-  - Multi-foto con etichette
-  - Replacement logic
-  - Guidance hardcodata — il valore nel JSON Gemini viene ignorato
+Rispetto a v17:
+  - Two-stage rimosso → da 16 chiamate a 4 per job
+  - Semaforo reale: il task parte solo quando il worker è libero
+  - is_bathroom: no finestre aggiuntive, piastrelle come elementi strutturali
+  - Retry 2× con backoff 15s
+  - Guidance Stage1 14→15, Stage2 eliminato (single-stage)
 """
 import asyncio
 import base64
@@ -458,65 +453,48 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
         photo_bytes = photos[idx]["content"] if idx < len(photos) else None
         is_bathroom = room.get("is_bathroom", False) or \
                       room.get("room_type", "").lower() in ("bagno", "bathroom")
+        cwc = room.get("current_wall_color", "")
 
         for esp in esperimenti:
             logic_id = esp.get("logic_id", "")
 
-            # ── D: DISABILITATO temporaneamente — riduce il carico API da 20 a 10 chiamate
-            # Riattivare aggiungendo: if logic_id == "D_FULL_SMART": ...
+            # ── D: DISABILITATO — riattivare quando E è stabile
             if logic_id == "D_FULL_SMART":
-                continue  # skip D per ora
+                continue
 
-            # ── E: wall-force con protezione bagni ───────────────────────────
+            # ── E: single-stage (no two-stage) — 1 chiamata per stanza invece di 2
+            # Dimezza il carico API: 4 stanze = 4 chiamate totali
             elif logic_id == "E_WALL_FORCE":
-                p1  = esp.get("prompt_stage1", "")
-                p2  = esp.get("prompt_stage2", "")
-                g1  = GUIDANCE["E_STAGE1_WALL"]
-                g2  = GUIDANCE["E_STAGE2_STAGE"]
-                cwc = esp.get("current_wall_color", "")
-                if not p1 or not p2 or not photo_bytes:
-                    continue
-                all_futures.append(("E_WALL_FORCE", i,
-                    loop.run_in_executor(
-                        _imagen_executor, _approach_E_two_stage,
-                        photo_bytes, p1, p2, g1, g2, cwc, is_bathroom
-                    )
-                ))
-
-            # ── C4, C5: invariati ─────────────────────────────────────────────
-            elif logic_id in ("C4_FULL", "C5_SMART_FULL"):
-                prompt   = esp.get("prompt_en", "")
-                guidance = GUIDANCE.get(logic_id, 25)
+                # Usa prompt_stage2 come prompt finale (più ricco di dettaglio arredo)
+                prompt = esp.get("prompt_stage2", "") or esp.get("prompt_stage1", "")
                 if not prompt or not photo_bytes:
                     continue
-                all_futures.append((logic_id, i,
-                    loop.run_in_executor(
-                        _imagen_executor, _approach_single,
-                        photo_bytes, prompt, guidance, logic_id
-                    )
+                all_futures.append(("E_WALL_FORCE", i,
+                    photo_bytes, prompt, cwc, is_bathroom
                 ))
 
-    # Esegui con semaforo: avvolgi ogni future in un wrapper che acquisisce il semaforo
+    # ── Esegui in sequenza con semaforo reale (non pre-submitting) ───────────
     sem = _get_semaphore()
+    results = [{} for _ in stanze]
 
-    async def _throttled(label: str, room_idx: int, fut):
+    async def _run_one(label, room_idx, photo_bytes, prompt, cwc, is_bathroom):
         async with sem:
-            try:
-                return label, room_idx, await fut
-            except Exception as e:
-                print(f"[{label} stanza {room_idx}] ERRORE gather: {e}")
-                return label, room_idx, None
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                _imagen_executor, _approach_E_single,
+                photo_bytes, prompt, cwc, is_bathroom
+            )
+            return label, room_idx, result
 
     tasks = [
-        _throttled(label, room_idx, fut)
-        for label, room_idx, fut in all_futures
+        _run_one(label, room_idx, pb, prompt, cwc, ib)
+        for label, room_idx, pb, prompt, cwc, ib in all_futures
     ]
     gathered = await asyncio.gather(*tasks, return_exceptions=True)
 
-    results = [{} for _ in stanze]
     for item in gathered:
         if isinstance(item, Exception):
-            print(f"[generate_staged_photos] ERRORE non atteso: {item}")
+            print(f"[generate_staged_photos] ERRORE: {item}")
             continue
         label, room_idx, result = item
         results[room_idx][label] = result
@@ -670,7 +648,86 @@ def _approach_D_two_stage(photo_bytes: bytes,
                 return None
 
 
-# ── Core: E two-stage (NUOVA) — forza cambio colore pareti ───────────────────
+# ── Core: E single-stage ─────────────────────────────────────────────────────
+# Una sola chiamata per stanza: prompt ricco con wall recolor + arredo.
+# Guidance=15 → trasformazione decisa ma ancora ancorata alla foto originale.
+
+def _approach_E_single(photo_bytes: bytes, prompt: str,
+                       current_wall_color: str = "",
+                       is_bathroom: bool = False) -> str | None:
+    import time
+
+    # Suffix: forza cambio colore + protezione bagno
+    suffix = (
+        f" The original {current_wall_color} color is completely replaced by solid opaque "
+        "structural coating. Zero bleed-through. 100% opacity."
+        if current_wall_color
+        else " All walls: solid opaque structural coating. Zero bleed-through."
+    )
+    if is_bathroom:
+        suffix += (
+            " BATHROOM: DO NOT add windows absent in original. "
+            "Keep all tile boundaries. Only recolor tiles or apply micro-cement overlay."
+        )
+    suffix += " Photorealistic, global illumination, consistent shadows, cinematic lighting, high-end interior photography."
+
+    prompt_final = prompt.split("Realistic fabric folds")[0].strip().rstrip(",") + suffix
+
+    neg = (
+        "distorted architecture, watermark, low quality, unrealistic, "
+        "original wall color retained, bleed-through, transparent paint, "
+        "floating objects, sticker effect, inconsistent shadows, cartoon, "
+        "overexposed, noise, dark shadows"
+    )
+    if current_wall_color:
+        neg += f", {current_wall_color} on walls"
+    if is_bathroom:
+        neg += ", added windows, fake windows, exterior view, missing tiles"
+
+    guidance = GUIDANCE["E_STAGE1_WALL"]  # 15
+
+    for attempt in range(1, 3):
+        try:
+            compressed = compress_image(photo_bytes, max_width=1024, quality=80)
+            bath_tag = " [BAGNO]" if is_bathroom else ""
+            print(f"[E-single{bath_tag}] attempt={attempt} {len(compressed)//1024}KB g={guidance}")
+            client = _get_vertex_client()
+
+            response = client.models.edit_image(
+                model="imagen-3.0-capability-001",
+                prompt=prompt_final,
+                reference_images=[
+                    genai_types.RawReferenceImage(
+                        reference_id=1,
+                        reference_image=genai_types.Image(image_bytes=compressed),
+                    )
+                ],
+                config=genai_types.EditImageConfig(
+                    edit_mode="EDIT_MODE_DEFAULT",
+                    number_of_images=1,
+                    guidance_scale=float(guidance),
+                    negative_prompt=neg,
+                    safety_filter_level="block_only_high",
+                ),
+            )
+            if response.generated_images:
+                print(f"[E-single] SUCCESS attempt={attempt}")
+                return base64.b64encode(response.generated_images[0].image.image_bytes).decode()
+            print(f"[E-single] 0 immagini (g={guidance}) — safety filter o quota")
+            return None
+
+        except Exception as e:
+            print(f"[E-single] ERRORE attempt={attempt}: {type(e).__name__}: {e}")
+            if attempt < 2:
+                wait = 15
+                print(f"[E-single] retry tra {wait}s…")
+                time.sleep(wait)
+            else:
+                print("[E-single] fallito dopo 2 tentativi")
+                return None
+
+
+
 
 def _approach_E_two_stage(photo_bytes: bytes,
                            prompt_stage1: str, prompt_stage2: str,
