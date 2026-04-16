@@ -75,7 +75,16 @@ def _get_vertex_client():
     return _vertex_client
 
 _gemini_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="gemini")
-_imagen_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="imagen")  # +2 per E
+_imagen_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="imagen")
+
+# Semaforo: max 3 chiamate Imagen simultanee — evita rate limiting Vertex AI
+_imagen_semaphore: asyncio.Semaphore | None = None
+
+def _get_semaphore() -> asyncio.Semaphore:
+    global _imagen_semaphore
+    if _imagen_semaphore is None:
+        _imagen_semaphore = asyncio.Semaphore(3)
+    return _imagen_semaphore
 
 _analysis_cache: dict[str, dict] = {}
 
@@ -482,17 +491,30 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
                     )
                 ))
 
+    # Esegui con semaforo: avvolgi ogni future in un wrapper che acquisisce il semaforo
+    sem = _get_semaphore()
+
+    async def _throttled(label: str, room_idx: int, fut):
+        async with sem:
+            try:
+                return label, room_idx, await fut
+            except Exception as e:
+                print(f"[{label} stanza {room_idx}] ERRORE gather: {e}")
+                return label, room_idx, None
+
+    tasks = [
+        _throttled(label, room_idx, fut)
+        for label, room_idx, fut in all_futures
+    ]
+    gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
     results = [{} for _ in stanze]
-    gathered = await asyncio.gather(
-        *[f for _, _, f in all_futures],
-        return_exceptions=True
-    )
-    for (key, room_idx, _), result in zip(all_futures, gathered):
-        if isinstance(result, Exception):
-            print(f"[{key} stanza {room_idx}] ERRORE: {result}\n{traceback.format_exc()}")
-            results[room_idx][key] = None
-        else:
-            results[room_idx][key] = result
+    for item in gathered:
+        if isinstance(item, Exception):
+            print(f"[generate_staged_photos] ERRORE non atteso: {item}")
+            continue
+        label, room_idx, result = item
+        results[room_idx][label] = result
 
     return results
 
@@ -501,47 +523,56 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
 
 def _approach_single(photo_bytes: bytes, prompt: str,
                      guidance: int, label: str) -> str | None:
-    try:
-        compressed = compress_image(photo_bytes, max_width=1024, quality=80)
-        print(f"[{label}] {len(compressed)//1024}KB  guidance={guidance}")
-        client = _get_vertex_client()
+    import time
+    for attempt in range(1, 3):  # max 2 tentativi
+        try:
+            compressed = compress_image(photo_bytes, max_width=1024, quality=80)
+            print(f"[{label}] attempt={attempt} {len(compressed)//1024}KB guidance={guidance}")
+            client = _get_vertex_client()
 
-        negative_base = (
-            "distorted architecture, blurry textures, changing window positions, "
-            "moving doors, wrong room proportions, deformed walls, different ceiling height, "
-            "watermark, low quality, unrealistic, flat lighting, cartoon, illustration, "
-            "floating objects, sticker effect, inconsistent shadows"
-        )
-        negative = (
-            negative_base + ", clutter, trash bags, old bulky furniture, yellowish tint, "
-            "original wall color retained, dirty surfaces, same walls as original"
-        ) if label == "C5_SMART_FULL" else negative_base
+            negative_base = (
+                "distorted architecture, blurry textures, changing window positions, "
+                "moving doors, wrong room proportions, deformed walls, different ceiling height, "
+                "watermark, low quality, unrealistic, flat lighting, cartoon, illustration, "
+                "floating objects, sticker effect, inconsistent shadows"
+            )
+            negative = (
+                negative_base + ", clutter, trash bags, old bulky furniture, yellowish tint, "
+                "original wall color retained, dirty surfaces, same walls as original"
+            ) if label == "C5_SMART_FULL" else negative_base
 
-        response = client.models.edit_image(
-            model="imagen-3.0-capability-001",
-            prompt=prompt,
-            reference_images=[
-                genai_types.RawReferenceImage(
-                    reference_id=1,
-                    reference_image=genai_types.Image(image_bytes=compressed),
-                )
-            ],
-            config=genai_types.EditImageConfig(
-                edit_mode="EDIT_MODE_DEFAULT",
-                number_of_images=1,
-                guidance_scale=float(guidance),
-                negative_prompt=negative,
-                safety_filter_level="block_only_high",
-            ),
-        )
-        if response.generated_images:
-            print(f"[{label}] SUCCESS")
-            return base64.b64encode(response.generated_images[0].image.image_bytes).decode()
-        print(f"[{label}] 0 immagini (guidance={guidance})")
-        return None
-    except Exception as e:
-        print(f"[{label}] ERRORE: {type(e).__name__}: {e}\n{traceback.format_exc()}")
-        return None
+            response = client.models.edit_image(
+                model="imagen-3.0-capability-001",
+                prompt=prompt,
+                reference_images=[
+                    genai_types.RawReferenceImage(
+                        reference_id=1,
+                        reference_image=genai_types.Image(image_bytes=compressed),
+                    )
+                ],
+                config=genai_types.EditImageConfig(
+                    edit_mode="EDIT_MODE_DEFAULT",
+                    number_of_images=1,
+                    guidance_scale=float(guidance),
+                    negative_prompt=negative,
+                    safety_filter_level="block_only_high",
+                ),
+            )
+            if response.generated_images:
+                print(f"[{label}] SUCCESS attempt={attempt}")
+                return base64.b64encode(response.generated_images[0].image.image_bytes).decode()
+            print(f"[{label}] 0 immagini (guidance={guidance}) — possibile safety filter o quota")
+            return None
+        except Exception as e:
+            err_str = f"{type(e).__name__}: {e}"
+            print(f"[{label}] ERRORE attempt={attempt}: {err_str}")
+            if attempt < 2:
+                wait = 10 * attempt  # 10s poi 20s
+                print(f"[{label}] retry tra {wait}s…")
+                time.sleep(wait)
+            else:
+                print(f"[{label}] fallito dopo 2 tentativi")
+                return None
 
 
 # ── Core: D two-stage (INVARIATA) ────────────────────────────────────────────
@@ -549,74 +580,89 @@ def _approach_single(photo_bytes: bytes, prompt: str,
 def _approach_D_two_stage(photo_bytes: bytes,
                            prompt_stage1: str, prompt_stage2: str,
                            guidance1: int, guidance2: int) -> str | None:
-    """Stage1 g=8 (libero), Stage2 g=10 (layering). Logica invariata da v16."""
-    try:
-        compressed = compress_image(photo_bytes, max_width=1024, quality=80)
-        print(f"[D Stage1] {len(compressed)//1024}KB  guidance={guidance1}")
-        client = _get_vertex_client()
+    """Stage1 g=8 (libero), Stage2 g=10 (layering). Retry con backoff."""
+    import time
 
-        r1 = client.models.edit_image(
-            model="imagen-3.0-capability-001",
-            prompt=prompt_stage1,
-            reference_images=[
-                genai_types.RawReferenceImage(
-                    reference_id=1,
-                    reference_image=genai_types.Image(image_bytes=compressed),
-                )
-            ],
-            config=genai_types.EditImageConfig(
-                edit_mode="EDIT_MODE_DEFAULT",
-                number_of_images=1,
-                guidance_scale=float(guidance1),
-                negative_prompt=(
-                    "furniture, objects, clutter, trash bags, messy cables, "
-                    "distorted architecture, watermark, low quality, unrealistic"
+    # Semplifica Stage2: riduci keyword tecniche a 3 essenziali
+    prompt_stage2_clean = (
+        prompt_stage2.split("Realistic fabric folds")[0].strip().rstrip(",")
+        + ". Photorealistic, global illumination, consistent shadows, cinematic lighting, high-end interior photography."
+    )
+
+    for attempt in range(1, 3):
+        try:
+            compressed = compress_image(photo_bytes, max_width=1024, quality=80)
+            print(f"[D Stage1] attempt={attempt} {len(compressed)//1024}KB guidance={guidance1}")
+            client = _get_vertex_client()
+
+            r1 = client.models.edit_image(
+                model="imagen-3.0-capability-001",
+                prompt=prompt_stage1,
+                reference_images=[
+                    genai_types.RawReferenceImage(
+                        reference_id=1,
+                        reference_image=genai_types.Image(image_bytes=compressed),
+                    )
+                ],
+                config=genai_types.EditImageConfig(
+                    edit_mode="EDIT_MODE_DEFAULT",
+                    number_of_images=1,
+                    guidance_scale=float(guidance1),
+                    negative_prompt=(
+                        "furniture, objects, clutter, trash bags, messy cables, "
+                        "distorted architecture, watermark, low quality, unrealistic"
+                    ),
+                    safety_filter_level="block_only_high",
                 ),
-                safety_filter_level="block_only_high",
-            ),
-        )
+            )
 
-        stage1_bytes = (
-            r1.generated_images[0].image.image_bytes
-            if r1.generated_images
-            else compress_image(photo_bytes, max_width=1024, quality=80)
-        )
-        if not r1.generated_images:
-            print("[D Stage1] 0 immagini → fallback su originale")
-        else:
-            print("[D Stage1] SUCCESS → Stage2")
+            stage1_bytes = (
+                r1.generated_images[0].image.image_bytes
+                if r1.generated_images
+                else compress_image(photo_bytes, max_width=1024, quality=80)
+            )
+            if not r1.generated_images:
+                print("[D Stage1] 0 immagini → fallback su originale")
+            else:
+                print("[D Stage1] SUCCESS → Stage2")
 
-        print(f"[D Stage2]  guidance={guidance2}")
-        r2 = client.models.edit_image(
-            model="imagen-3.0-capability-001",
-            prompt=prompt_stage2,
-            reference_images=[
-                genai_types.RawReferenceImage(
-                    reference_id=1,
-                    reference_image=genai_types.Image(image_bytes=stage1_bytes),
-                )
-            ],
-            config=genai_types.EditImageConfig(
-                edit_mode="EDIT_MODE_DEFAULT",
-                number_of_images=1,
-                guidance_scale=float(guidance2),
-                negative_prompt=(
-                    "empty room, bare walls, clutter, trash bags, messy cables, "
-                    "dark shadows, bad exposure, overexposed, harsh lighting, noise, grainy, "
-                    "bad framing, overcrowded, cartoon style, flat lighting, floating objects, "
-                    "sticker effect, inconsistent shadows, distorted architecture, watermark"
+            print(f"[D Stage2] guidance={guidance2}")
+            r2 = client.models.edit_image(
+                model="imagen-3.0-capability-001",
+                prompt=prompt_stage2_clean,
+                reference_images=[
+                    genai_types.RawReferenceImage(
+                        reference_id=1,
+                        reference_image=genai_types.Image(image_bytes=stage1_bytes),
+                    )
+                ],
+                config=genai_types.EditImageConfig(
+                    edit_mode="EDIT_MODE_DEFAULT",
+                    number_of_images=1,
+                    guidance_scale=float(guidance2),
+                    negative_prompt=(
+                        "empty room, bare walls, clutter, trash bags, dark shadows, "
+                        "overexposed, noise, cartoon, floating objects, "
+                        "inconsistent shadows, distorted architecture, watermark"
+                    ),
+                    safety_filter_level="block_only_high",
                 ),
-                safety_filter_level="block_only_high",
-            ),
-        )
-        if r2.generated_images:
-            print("[D Stage2] SUCCESS")
-            return base64.b64encode(r2.generated_images[0].image.image_bytes).decode()
-        print(f"[D Stage2] 0 immagini (guidance={guidance2})")
-        return None
-    except Exception as e:
-        print(f"[D two-stage] ERRORE: {type(e).__name__}: {e}\n{traceback.format_exc()}")
-        return None
+            )
+            if r2.generated_images:
+                print(f"[D Stage2] SUCCESS attempt={attempt}")
+                return base64.b64encode(r2.generated_images[0].image.image_bytes).decode()
+            print(f"[D Stage2] 0 immagini (guidance={guidance2}) — safety filter o quota")
+            return None
+
+        except Exception as e:
+            print(f"[D two-stage] ERRORE attempt={attempt}: {type(e).__name__}: {e}")
+            if attempt < 2:
+                wait = 10 * attempt
+                print(f"[D] retry tra {wait}s…")
+                time.sleep(wait)
+            else:
+                print("[D] fallito dopo 2 tentativi")
+                return None
 
 
 # ── Core: E two-stage (NUOVA) — forza cambio colore pareti ───────────────────
@@ -626,91 +672,101 @@ def _approach_E_two_stage(photo_bytes: bytes,
                            guidance1: int, guidance2: int,
                            current_wall_color: str = "") -> str | None:
     """
-    E_WALL_FORCE: come D ma Stage1 con guidance più alto (14) per forzare
-    il cambio colore pareti. Negative Stage1 specifico per eliminare
-    il colore originale residuo.
+    E_WALL_FORCE: Stage1 guidance=14 forza cambio colore pareti.
+    Retry con backoff esponenziale. Stage2 con keyword ridotte.
     """
-    try:
-        compressed = compress_image(photo_bytes, max_width=1024, quality=80)
-        print(f"[E Stage1 WallForce] {len(compressed)//1024}KB  guidance={guidance1}")
-        client = _get_vertex_client()
+    import time
 
-        # Negative Stage1 specifico E: menziona il colore attuale da eliminare
-        base_neg_e1 = (
-            "furniture, objects, clutter, trash bags, messy cables, "
-            "distorted architecture, watermark, low quality, unrealistic, "
-            "original wall color, bleed-through, transparent paint, "
-            "color bleeding, previous paint color showing through, dirty walls"
-        )
-        # Inietta il colore specifico se disponibile
-        neg_e1 = (
-            base_neg_e1 + f", {current_wall_color}, {current_wall_color} walls"
-            if current_wall_color
-            else base_neg_e1
-        )
+    # Semplifica Stage2: riduci keyword tecniche a 3 essenziali
+    prompt_stage2_clean = (
+        prompt_stage2.split("Realistic fabric folds")[0].strip().rstrip(",")
+        + ". Photorealistic, global illumination, consistent shadows, cinematic lighting, high-end interior photography."
+    )
 
-        r1 = client.models.edit_image(
-            model="imagen-3.0-capability-001",
-            prompt=prompt_stage1,
-            reference_images=[
-                genai_types.RawReferenceImage(
-                    reference_id=1,
-                    reference_image=genai_types.Image(image_bytes=compressed),
-                )
-            ],
-            config=genai_types.EditImageConfig(
-                edit_mode="EDIT_MODE_DEFAULT",
-                number_of_images=1,
-                guidance_scale=float(guidance1),
-                negative_prompt=neg_e1,
-                safety_filter_level="block_only_high",
-            ),
-        )
+    base_neg_e1 = (
+        "furniture, objects, clutter, trash bags, messy cables, "
+        "distorted architecture, watermark, low quality, unrealistic, "
+        "original wall color, bleed-through, transparent paint, "
+        "color bleeding, previous paint color showing through, dirty walls"
+    )
+    neg_e1 = (
+        base_neg_e1 + f", {current_wall_color}, {current_wall_color} walls"
+        if current_wall_color
+        else base_neg_e1
+    )
+    neg_e2 = (
+        "empty room, bare walls, clutter, trash bags, dark shadows, "
+        "overexposed, noise, cartoon, floating objects, "
+        "inconsistent shadows, distorted architecture, watermark, "
+        "yellowish tint, original wall color retained, bleed-through"
+    )
+    if current_wall_color:
+        neg_e2 += f", {current_wall_color} on walls"
 
-        stage1_bytes = (
-            r1.generated_images[0].image.image_bytes
-            if r1.generated_images
-            else compress_image(photo_bytes, max_width=1024, quality=80)
-        )
-        if not r1.generated_images:
-            print("[E Stage1] 0 immagini → fallback su originale")
-        else:
-            print("[E Stage1] SUCCESS → Stage2")
+    for attempt in range(1, 3):
+        try:
+            compressed = compress_image(photo_bytes, max_width=1024, quality=80)
+            print(f"[E Stage1] attempt={attempt} {len(compressed)//1024}KB guidance={guidance1}")
+            client = _get_vertex_client()
 
-        # Negative Stage2: impedisce pareti vuote e mantiene fotorealismo
-        neg_e2 = (
-            "empty room, bare walls, clutter, trash bags, messy cables, "
-            "dark shadows, bad exposure, overexposed, harsh lighting, noise, grainy, "
-            "bad framing, overcrowded, cartoon style, flat lighting, floating objects, "
-            "sticker effect, inconsistent shadows, distorted architecture, watermark, "
-            "yellowish tint, original wall color retained, bleed-through"
-        )
-        if current_wall_color:
-            neg_e2 += f", {current_wall_color} on walls"
+            r1 = client.models.edit_image(
+                model="imagen-3.0-capability-001",
+                prompt=prompt_stage1,
+                reference_images=[
+                    genai_types.RawReferenceImage(
+                        reference_id=1,
+                        reference_image=genai_types.Image(image_bytes=compressed),
+                    )
+                ],
+                config=genai_types.EditImageConfig(
+                    edit_mode="EDIT_MODE_DEFAULT",
+                    number_of_images=1,
+                    guidance_scale=float(guidance1),
+                    negative_prompt=neg_e1,
+                    safety_filter_level="block_only_high",
+                ),
+            )
 
-        print(f"[E Stage2]  guidance={guidance2}")
-        r2 = client.models.edit_image(
-            model="imagen-3.0-capability-001",
-            prompt=prompt_stage2,
-            reference_images=[
-                genai_types.RawReferenceImage(
-                    reference_id=1,
-                    reference_image=genai_types.Image(image_bytes=stage1_bytes),
-                )
-            ],
-            config=genai_types.EditImageConfig(
-                edit_mode="EDIT_MODE_DEFAULT",
-                number_of_images=1,
-                guidance_scale=float(guidance2),
-                negative_prompt=neg_e2,
-                safety_filter_level="block_only_high",
-            ),
-        )
-        if r2.generated_images:
-            print("[E Stage2] SUCCESS")
-            return base64.b64encode(r2.generated_images[0].image.image_bytes).decode()
-        print(f"[E Stage2] 0 immagini (guidance={guidance2})")
-        return None
-    except Exception as e:
-        print(f"[E two-stage] ERRORE: {type(e).__name__}: {e}\n{traceback.format_exc()}")
-        return None
+            stage1_bytes = (
+                r1.generated_images[0].image.image_bytes
+                if r1.generated_images
+                else compress_image(photo_bytes, max_width=1024, quality=80)
+            )
+            if not r1.generated_images:
+                print("[E Stage1] 0 immagini → fallback su originale")
+            else:
+                print("[E Stage1] SUCCESS → Stage2")
+
+            print(f"[E Stage2] guidance={guidance2}")
+            r2 = client.models.edit_image(
+                model="imagen-3.0-capability-001",
+                prompt=prompt_stage2_clean,
+                reference_images=[
+                    genai_types.RawReferenceImage(
+                        reference_id=1,
+                        reference_image=genai_types.Image(image_bytes=stage1_bytes),
+                    )
+                ],
+                config=genai_types.EditImageConfig(
+                    edit_mode="EDIT_MODE_DEFAULT",
+                    number_of_images=1,
+                    guidance_scale=float(guidance2),
+                    negative_prompt=neg_e2,
+                    safety_filter_level="block_only_high",
+                ),
+            )
+            if r2.generated_images:
+                print(f"[E Stage2] SUCCESS attempt={attempt}")
+                return base64.b64encode(r2.generated_images[0].image.image_bytes).decode()
+            print(f"[E Stage2] 0 immagini (guidance={guidance2}) — safety filter o quota")
+            return None
+
+        except Exception as e:
+            print(f"[E two-stage] ERRORE attempt={attempt}: {type(e).__name__}: {e}")
+            if attempt < 2:
+                wait = 10 * attempt
+                print(f"[E] retry tra {wait}s…")
+                time.sleep(wait)
+            else:
+                print("[E] fallito dopo 2 tentativi")
+                return None
