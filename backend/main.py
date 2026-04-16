@@ -1,6 +1,6 @@
 """
 HomeStager AI — FastAPI Backend v18
-Pipeline: Upload → PhotoValidator → Gemini 2.5 Flash → Imagen 3 → WeasyPrint PDF → SendGrid
+Pipeline: Upload → PhotoValidator → Gemini 2.5 Flash → Imagen 3 → WeasyPrint PDF → SendGrid2
 """
 import base64
 import traceback
