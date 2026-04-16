@@ -195,3 +195,23 @@ async def _process_job(job_id: str, photos: list, prefs: dict, email: str):
             "traceback": tb,
             "validation": jobs[job_id].get("validation", {}),
         }
+        from fastapi import Body
+
+import base64
+
+@app.post("/stage-image")
+async def stage_image(
+    photo_b64: str = Body(...),
+    photo_mime: str = Body(...),
+    prompt: str = Body(...),
+):
+    from ai_service import _approach_C_edit
+    import asyncio
+    loop = asyncio.get_running_loop()
+    photo_bytes = base64.b64decode(photo_b64)
+    result_b64 = await loop.run_in_executor(
+        None, _approach_C_edit, photo_bytes, prompt, 26, "DEMO"
+    )
+    if not result_b64:
+        raise HTTPException(status_code=500, detail="Generazione immagine fallita")
+    return {"image_b64": result_b64}
