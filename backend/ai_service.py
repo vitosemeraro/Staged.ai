@@ -61,8 +61,8 @@ GUIDANCE = {
     "C5_SMART_FULL":    22,
     "D_STAGE1_CLEAN":    8,
     "D_STAGE2_STAGE":   10,
-    "E_STAGE1_WALL":    14,   # più alto → forza cambio colore pareti
-    "E_STAGE2_STAGE":   10,
+    "E_STAGE1_WALL":    15,   # alzato a 15: forza copertura colore pareti originale
+    "E_STAGE2_STAGE":   12,   # alzato a 12: più dettaglio nell'arredo finale
 }
 
 _vertex_client = None
@@ -75,15 +75,15 @@ def _get_vertex_client():
     return _vertex_client
 
 _gemini_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="gemini")
-_imagen_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="imagen")
+_imagen_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="imagen")
 
-# Semaforo: max 3 chiamate Imagen simultanee — evita rate limiting Vertex AI
+# Semaforo: max 2 chiamate Imagen simultanee
 _imagen_semaphore: asyncio.Semaphore | None = None
 
 def _get_semaphore() -> asyncio.Semaphore:
     global _imagen_semaphore
     if _imagen_semaphore is None:
-        _imagen_semaphore = asyncio.Semaphore(3)
+        _imagen_semaphore = asyncio.Semaphore(2)
     return _imagen_semaphore
 
 _analysis_cache: dict[str, dict] = {}
@@ -249,6 +249,17 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "3) Stima la direzione delle ombre portate. "
         "4) Identifica il COLORE ESATTO delle pareti attuali (es. 'giallo paglierino', "
         "'beige opaco', 'bianco sporco') — questa informazione è critica per la variante E. "
+        "5) Identifica se la stanza è un BAGNO tramite il campo 'is_bathroom'.\n\n"
+        "REGOLE FERREE v21:\n"
+        "PROTOCOLLO BAGNO: Se is_bathroom=true, è VIETATO aggiungere finestre non visibili "
+        "nella foto originale. Le piastrelle esistenti sono elementi strutturali: non vanno "
+        "rimosse ma ricolorate con 'tile paint' o coperte con 'micro-cement finish overlay'. "
+        "Non mettere mai finestre fittizie in un bagno interno.\n"
+        "PITTURA PARETI: Nei prompt usa sempre 'solid opaque structural coating' per coprire "
+        "il colore originale. Mai 'paint over' o 'repaint' da soli — aggiungere sempre "
+        "'zero bleed-through, 100% opacity, no original color visible'.\n"
+        "COERENZA COSTI: Ogni elemento aggiunto nel rendering (piastrelle, mobili, luci) "
+        "DEVE avere una voce corrispondente in 'interventi' con costo_min e costo_max.\n"
         "I prompt_en devono includere 'consistent shadows', 'global illumination', "
         "'ambient occlusion' per evitare l'effetto sticker. "
         "detected_elements elenca SOLO cio' che e' fisicamente visibile. "
@@ -319,6 +330,8 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "    {{\n"
         "      \"nome\": \"Nome stanza\",\n"
         "      \"indice_foto\": 0,\n"
+        "      \"room_type\": \"bagno|cucina|camera|soggiorno|balcone|altro\",\n"
+        "      \"is_bathroom\": false,\n"
         "      \"detected_elements\": [\"elemento visibile\", \"no windows visible se assenti\"],\n"
         "      \"current_wall_color\": \"es. giallo paglierino opaco\",\n"
         "      \"target_wall_color\": \"es. warm grey\",\n"
@@ -443,38 +456,30 @@ async def generate_staged_photos(photos: list, analysis: dict) -> list:
         idx         = room.get("indice_foto", i)
         esperimenti = room.get("esperimenti_staged", [])
         photo_bytes = photos[idx]["content"] if idx < len(photos) else None
+        is_bathroom = room.get("is_bathroom", False) or \
+                      room.get("room_type", "").lower() in ("bagno", "bathroom")
 
         for esp in esperimenti:
             logic_id = esp.get("logic_id", "")
 
-            # ── D: invariata ──────────────────────────────────────────────────
+            # ── D: DISABILITATO temporaneamente — riduce il carico API da 20 a 10 chiamate
+            # Riattivare aggiungendo: if logic_id == "D_FULL_SMART": ...
             if logic_id == "D_FULL_SMART":
-                p1 = esp.get("prompt_stage1", "")
-                p2 = esp.get("prompt_stage2", "")
-                g1 = GUIDANCE["D_STAGE1_CLEAN"]   # hardcodato — ignora JSON
-                g2 = GUIDANCE["D_STAGE2_STAGE"]
-                if not p1 or not p2 or not photo_bytes:
-                    continue
-                all_futures.append(("D_FULL_SMART", i,
-                    loop.run_in_executor(
-                        _imagen_executor, _approach_D_two_stage,
-                        photo_bytes, p1, p2, g1, g2
-                    )
-                ))
+                continue  # skip D per ora
 
-            # ── E: nuova variante wall-force ──────────────────────────────────
+            # ── E: wall-force con protezione bagni ───────────────────────────
             elif logic_id == "E_WALL_FORCE":
                 p1  = esp.get("prompt_stage1", "")
                 p2  = esp.get("prompt_stage2", "")
-                g1  = GUIDANCE["E_STAGE1_WALL"]   # hardcodato: 14
-                g2  = GUIDANCE["E_STAGE2_STAGE"]  # hardcodato: 10
+                g1  = GUIDANCE["E_STAGE1_WALL"]
+                g2  = GUIDANCE["E_STAGE2_STAGE"]
                 cwc = esp.get("current_wall_color", "")
                 if not p1 or not p2 or not photo_bytes:
                     continue
                 all_futures.append(("E_WALL_FORCE", i,
                     loop.run_in_executor(
                         _imagen_executor, _approach_E_two_stage,
-                        photo_bytes, p1, p2, g1, g2, cwc
+                        photo_bytes, p1, p2, g1, g2, cwc, is_bathroom
                     )
                 ))
 
@@ -670,30 +675,58 @@ def _approach_D_two_stage(photo_bytes: bytes,
 def _approach_E_two_stage(photo_bytes: bytes,
                            prompt_stage1: str, prompt_stage2: str,
                            guidance1: int, guidance2: int,
-                           current_wall_color: str = "") -> str | None:
+                           current_wall_color: str = "",
+                           is_bathroom: bool = False) -> str | None:
     """
-    E_WALL_FORCE: Stage1 guidance=14 forza cambio colore pareti.
-    Retry con backoff esponenziale. Stage2 con keyword ridotte.
+    E_WALL_FORCE v21:
+    - Stage1 guidance=15: copertura opaca forzata del colore pareti originale
+    - Stage2 guidance=12: più dettaglio nell'arredo
+    - Protezione bagni: no finestre fantasma, piastrelle come elementi strutturali
+    - Retry con backoff esponenziale
     """
     import time
 
-    # Semplifica Stage2: riduci keyword tecniche a 3 essenziali
-    prompt_stage2_clean = (
-        prompt_stage2.split("Realistic fabric folds")[0].strip().rstrip(",")
-        + ". Photorealistic, global illumination, consistent shadows, cinematic lighting, high-end interior photography."
+    # Rinforzo prompt Stage1: solid opaque coating
+    p1_suffix = (
+        f" The original {current_wall_color} color is completely hidden by solid opaque "
+        "structural coating. Zero bleed-through. 100% opacity. No original color visible anywhere."
+        if current_wall_color
+        else " Solid opaque structural coating on all walls. Zero bleed-through. 100% opacity."
     )
+    if is_bathroom:
+        p1_suffix += (
+            " BATHROOM: DO NOT add any windows that were not in the original photo. "
+            "Keep all existing tile boundaries exactly as in the original. "
+            "Tiles are structural elements — only recolor or apply micro-cement finish overlay."
+        )
+    prompt_stage1_final = prompt_stage1 + p1_suffix
 
+    # Rinforzo prompt Stage2: keyword ridotte + protezione bagno
+    p2_base = (
+        prompt_stage2.split("Realistic fabric folds")[0].strip().rstrip(",")
+        + ". Photorealistic, global illumination, consistent shadows, "
+        "cinematic lighting, high-end interior photography."
+    )
+    if is_bathroom:
+        p2_base += (
+            " BATHROOM RULES: No windows added. Tiles unchanged in shape and position. "
+            "Preserve original ceiling light or replace only with similar overhead fixture."
+        )
+    prompt_stage2_final = p2_base
+
+    # Negative prompts
     base_neg_e1 = (
         "furniture, objects, clutter, trash bags, messy cables, "
         "distorted architecture, watermark, low quality, unrealistic, "
         "original wall color, bleed-through, transparent paint, "
         "color bleeding, previous paint color showing through, dirty walls"
     )
-    neg_e1 = (
-        base_neg_e1 + f", {current_wall_color}, {current_wall_color} walls"
-        if current_wall_color
-        else base_neg_e1
-    )
+    neg_e1 = base_neg_e1
+    if current_wall_color:
+        neg_e1 += f", {current_wall_color}, {current_wall_color} walls"
+    if is_bathroom:
+        neg_e1 += ", added windows, fake windows, new windows, exterior view"
+
     neg_e2 = (
         "empty room, bare walls, clutter, trash bags, dark shadows, "
         "overexposed, noise, cartoon, floating objects, "
@@ -702,16 +735,19 @@ def _approach_E_two_stage(photo_bytes: bytes,
     )
     if current_wall_color:
         neg_e2 += f", {current_wall_color} on walls"
+    if is_bathroom:
+        neg_e2 += ", added windows, fake windows, new windows, exterior view, missing tiles"
 
     for attempt in range(1, 3):
         try:
             compressed = compress_image(photo_bytes, max_width=1024, quality=80)
-            print(f"[E Stage1] attempt={attempt} {len(compressed)//1024}KB guidance={guidance1}")
+            bath_tag = " [BAGNO]" if is_bathroom else ""
+            print(f"[E Stage1{bath_tag}] attempt={attempt} {len(compressed)//1024}KB g={guidance1}")
             client = _get_vertex_client()
 
             r1 = client.models.edit_image(
                 model="imagen-3.0-capability-001",
-                prompt=prompt_stage1,
+                prompt=prompt_stage1_final,
                 reference_images=[
                     genai_types.RawReferenceImage(
                         reference_id=1,
@@ -732,15 +768,14 @@ def _approach_E_two_stage(photo_bytes: bytes,
                 if r1.generated_images
                 else compress_image(photo_bytes, max_width=1024, quality=80)
             )
-            if not r1.generated_images:
-                print("[E Stage1] 0 immagini → fallback su originale")
-            else:
-                print("[E Stage1] SUCCESS → Stage2")
+            print(
+                f"[E Stage1] {'SUCCESS' if r1.generated_images else '0 img → fallback originale'}"
+            )
 
-            print(f"[E Stage2] guidance={guidance2}")
+            print(f"[E Stage2{bath_tag}] g={guidance2}")
             r2 = client.models.edit_image(
                 model="imagen-3.0-capability-001",
-                prompt=prompt_stage2_clean,
+                prompt=prompt_stage2_final,
                 reference_images=[
                     genai_types.RawReferenceImage(
                         reference_id=1,
@@ -758,7 +793,7 @@ def _approach_E_two_stage(photo_bytes: bytes,
             if r2.generated_images:
                 print(f"[E Stage2] SUCCESS attempt={attempt}")
                 return base64.b64encode(r2.generated_images[0].image.image_bytes).decode()
-            print(f"[E Stage2] 0 immagini (guidance={guidance2}) — safety filter o quota")
+            print(f"[E Stage2] 0 immagini (g={guidance2}) — safety filter o quota")
             return None
 
         except Exception as e:
