@@ -563,6 +563,7 @@ async def generate_staged_photos(photos: list, analysis: dict,
 
         is_bathroom = room.get("is_bathroom", False) or \
                       room.get("room_type", "").lower() in ("bagno", "bathroom")
+        room_type   = room.get("room_type", "")
         cwc         = room.get("current_wall_color", "")
         fpc         = room.get("force_paint_color", style_dna.get("palette", "").split(",")[0].strip() or "warm white")
         fpf         = room.get("force_paint_finish", "matte")
@@ -571,6 +572,7 @@ async def generate_staged_photos(photos: list, analysis: dict,
         spatial     = room.get("spatial_map", "")
         keywords    = room.get("mandatory_visual_keywords", [])
         detected    = room.get("detected_elements", [])
+        interventions = room.get("interventi", [])
 
         esp = next(
             (e for e in room.get("esperimenti_staged", []) if e.get("logic_id") == "E_WALL_FORCE"),
@@ -582,12 +584,16 @@ async def generate_staged_photos(photos: list, analysis: dict,
             cwc, fpc, fpf, floor, light, is_bathroom,
             detected_elements=detected,
             style_dna=style_dna,
+            room_type=room_type,
+            interventions=interventions,
         )
         stage2_prompt = _build_stage2_prompt(
             esp.get("prompt_stage2", ""),
             fpc, fpf, keywords, spatial, is_bathroom,
             style_dna=style_dna,
             budget=budget,
+            room_type=room_type,
+            interventions=interventions,
         )
 
         loop = asyncio.get_running_loop()
@@ -605,139 +611,332 @@ async def generate_staged_photos(photos: list, analysis: dict,
 def _build_stage1_prompt(base: str, cwc: str, fpc: str, fpf: str,
                           floor: str, light: str, is_bathroom: bool,
                           detected_elements: list | None = None,
-                          style_dna: dict | None = None) -> str:
+                          style_dna: dict | None = None,
+                          room_type: str = "",
+                          interventions: list | None = None) -> str:
     """
-    Stage 1 v24 — The Canvas:
-    Decluttering esplicito per categoria + force-paint aggressivo.
+    Stage 1 v24.1 — The Canvas (Hard-Refurbishment):
+    - Pareti: force-paint con solid opaque coating
+    - Bagno: STRUCTURAL OVERWRITE piastrelle con micro-cement
+    - Cucina: STRUCTURAL OVERWRITE ante + piastrelle backsplash
+    - Anti-patterns: elimina esplicitamente colori obsoleti nominati
+    - Decluttering per categoria
     """
-    dna = style_dna or {}
+    dna  = style_dna or {}
+    ivs  = interventions or []
+    det  = detected_elements or []
+    is_kitchen = "cucina" in room_type.lower() or "kitchen" in room_type.lower()
 
-    # ── Force-paint: copre al 100% il colore originale ───────────────────────
+    # ── Individua colori/materiali obsoleti da eliminare ─────────────────────
+    anti_colors = []
+    if cwc:
+        anti_colors.append(cwc)
+    for el in det:
+        el_l = el.lower()
+        if any(c in el_l for c in ["blu", "blue", "azzurr", "giallo", "yellow",
+                                    "verde", "marrone", "arancio", "floral",
+                                    "striped", "righe", "fantasia", "pattern"]):
+            anti_colors.append(el)
+    anti_block = ""
+    if anti_colors:
+        anti_block = (
+            "ANTI-PATTERN ELIMINATION: The following colors and patterns are "
+            "COMPLETELY ELIMINATED — zero trace visible anywhere: "
+            + ", ".join(anti_colors[:5]) + ". "
+            "Replace everything with clean neutral surfaces. "
+        )
+
+    # ── Individua se ci sono interventi su piastrelle/ante dal preventivo ────
+    has_microcement = any(
+        any(k in (iv.get("titolo", "") + iv.get("dettaglio", "")).lower()
+            for k in ["micro", "piastrelle", "tile", "rivestimento"])
+        for iv in ivs
+    )
+    has_cabinet_reface = any(
+        any(k in (iv.get("titolo", "") + iv.get("dettaglio", "")).lower()
+            for k in ["ante", "cabinet", "vernicia", "rifacimento"])
+        for iv in ivs
+    )
+    has_sanitari = any(
+        any(k in (iv.get("titolo", "") + iv.get("dettaglio", "")).lower()
+            for k in ["wc", "bidet", "sanitari", "lavandino", "vasca"])
+        for iv in ivs
+    )
+
+    # ── Paint target dal DNA di stile se Gemini non ha specificato ───────────
     paint_target = fpc or (dna.get("palette", "").split(",")[0].strip()) or "warm white"
     paint_finish = fpf or "matte"
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # BAGNO
+    # ═══════════════════════════════════════════════════════════════════════════
+    if is_bathroom:
+        tile_cmd = (
+            "STRUCTURAL OVERWRITE — TILES: ALL existing tiles (blue, aqua, any color) "
+            "are COMPLETELY HIDDEN under a solid opaque layer of light warm grey "
+            "micro-cement finish (Isoplam Microverlay style). "
+            "Zero original tile color visible. Zero original tile texture visible. "
+            "The tile grid lines are COVERED. Only smooth matte grey surface remains. "
+            "Upper walls above tiles: solid opaque warm white matte paint. "
+        ) if has_microcement else (
+            "TILE RECOLOR: Existing tiles are painted over with solid opaque white "
+            "tile paint. Zero original blue/aqua color showing through. "
+        )
+
+        sanitari_cmd = (
+            "FIXTURE REMOVAL: Remove old toilet, bidet, sink, vanity cabinet, "
+            "mirror, and all chrome fixtures. Result: empty positions on wall. "
+        ) if has_sanitari else (
+            "Remove all personal items, bottles, soaps, bath mats from surfaces. "
+        )
+
+        floor_cmd = (
+            "Floor: existing terrazzo/graniglia clean and polished. "
+            "Ceiling: freshly painted white. "
+        )
+
+        declutter = (
+            "Remove: all personal objects, shampoo bottles, soap, towels on floor, "
+            "shower curtain, old chrome rails and accessories, toilet brush holder, "
+            "metal shelf contents. "
+            "Keep: bathtub structure, window, radiator. "
+            "DO NOT add windows not present in original. "
+        )
+
+        return (
+            anti_block + tile_cmd + sanitari_cmd + declutter + floor_cmd
+            + f"Lighting: {light}, bright and clean. "
+            + f"Empty renovated bathroom shell. {SCENIC_CONFIG}."
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # CUCINA
+    # ═══════════════════════════════════════════════════════════════════════════
+    if is_kitchen:
+        cabinet_color = "sage green matte" if "verde" in " ".join(
+            iv.get("dettaglio", "") for iv in ivs).lower() else "warm white matte"
+
+        cabinet_cmd = (
+            f"CABINET OVERWRITE: ALL existing cabinet doors (blue, any color) are "
+            f"NOW repainted with solid high-opacity {cabinet_color} paint. "
+            "Zero original blue color showing through. "
+            "Original cabinet hardware/handles replaced with natural wood pulls. "
+        ) if has_cabinet_reface else (
+            "Cabinet doors: repainted white matte. Zero original color visible. "
+        )
+
+        backsplash_cmd = (
+            "BACKSPLASH OVERWRITE: All existing tile backsplash "
+            "is COMPLETELY COVERED with light grey micro-cement finish. "
+            "Zero original white tile texture or grout lines visible. "
+            "Smooth matte grey surface. "
+        ) if has_microcement else (
+            "Backsplash tiles: cleaned and white, grout lines visible. "
+        )
+
+        wall_cmd = (
+            f"Upper walls: solid opaque warm white matte paint. "
+            "Zero original yellowed or stained paint visible. "
+        )
+
+        appliance_cmd = (
+            "Remove: old white oven, old range hood, old dishwasher. "
+            "Keep: refrigerator position, sink position. "
+            "Result: clean empty appliance spaces ready for new units. "
+        )
+
+        declutter = (
+            "Remove: plaid tablecloth, old chairs, personal items on surfaces, "
+            "magnets from fridge, dish rack, old curtains. "
+            "Keep: window, door to balcony, fixed cabinets. "
+        )
+
+        floor_cmd = "Floor: existing graniglia/terrazzo clean. Ceiling: white. "
+
+        return (
+            anti_block + cabinet_cmd + backsplash_cmd + wall_cmd
+            + appliance_cmd + declutter + floor_cmd
+            + f"Lighting: {light}, bright natural light from balcony door. "
+            + f"Empty renovated kitchen shell. {SCENIC_CONFIG}."
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ALTRI AMBIENTI (soggiorno, camera, ecc.)
+    # ═══════════════════════════════════════════════════════════════════════════
     paint_cmd = (
-        f"WALL TRANSFORMATION: The original {cwc} colored walls are now "
-        if cwc else "WALL TRANSFORMATION: All walls are now "
+        f"WALL TRANSFORMATION: Original {cwc} walls are now " if cwc
+        else "WALL TRANSFORMATION: All walls are now "
     )
     paint_cmd += (
         f"completely covered with solid high-opacity {paint_target} {paint_finish} paint. "
-        "Zero bleed-through. Zero transparency. 100% solid coverage. "
-        f"No trace of any previous color. Freshly painted {paint_target} surfaces. "
+        "Zero bleed-through. 100% solid coverage. No trace of previous color. "
     )
 
-    # ── Decluttering esplicito per categoria ─────────────────────────────────
-    if is_bathroom:
-        declutter = (
-            "BATHROOM PROTOCOL: Keep all tile boundaries and structural elements. "
-            "Remove only portable items: soap bottles, shampoo, bath mats, toothbrushes, "
-            "personal objects, towels on floor. "
-            "Recolor tiles with micro-cement white matte overlay (keep tile grid lines). "
-            "DO NOT add windows not visible in original photo. "
-        )
-        materials_cmd = f"Floor: {floor}. Ceiling: white. "
-    else:
-        # Lista oggetti da rimuovere basata su detected_elements di Gemini
-        ugly_items = ""
-        if detected_elements:
-            targets = [e for e in detected_elements if any(
-                bad in e.lower() for bad in [
-                    "old", "datato", "brutto", "ingombrante", "obsoleto",
-                    "spazzatura", "cavo", "filo", "sacco", "bag", "clutter",
-                    "disordinato", "personali", "oggetti", "scaffale metallico",
-                ]
-            )]
-            if targets:
-                ugly_items = "Remove specifically: " + ", ".join(targets[:6]) + ". "
+    ugly_items = ""
+    bad_keywords = ["old", "datato", "brutto", "ingombrante", "obsoleto",
+                    "spazzatura", "cavo", "sacco", "bag", "metallico", "ventilatore"]
+    targets = [e for e in det if any(b in e.lower() for b in bad_keywords)]
+    if targets:
+        ugly_items = "Remove specifically: " + ", ".join(targets[:6]) + ". "
 
-        declutter = (
-            "DECLUTTERING: Remove ALL furniture and objects. "
-            "Explicitly remove: electrical cables, personal items, trash bags, "
-            "old bulky wardrobes, dated curtains, obsolete electronics, "
-            "decorative clutter, photo frames on surfaces. "
-            + ugly_items +
-            "Keep ONLY: fixed architecture (windows, doors, built-in modern wardrobes). "
-            "Result: bright empty room with clean sightlines. "
-        )
-        materials_cmd = (
-            f"Floor: {floor}, swept and clean. "
-            f"Ceiling: white, clean. "
-        )
+    declutter = (
+        "DECLUTTERING: Remove ALL furniture, rugs, curtains, and decorative objects. "
+        "Explicitly remove: ceiling fan, bookshelf, dining table with chairs, "
+        "old sofas with striped/floral fabric, wall-mounted shelves with objects, "
+        "framed religious images, floor lamps. "
+        + ugly_items +
+        "Keep ONLY: windows, doors, radiator, built-in elements. "
+        "Result: bright empty room. "
+    )
 
-    # ── Luce e qualità ────────────────────────────────────────────────────────
-    light_cmd = f"Natural light from {light}. No harsh shadows. Evenly lit. "
-    end_cmd   = f"Empty architectural shell. {SCENIC_CONFIG}."
-
-    return paint_cmd + declutter + materials_cmd + light_cmd + end_cmd
+    return (
+        anti_block + paint_cmd + declutter
+        + f"Floor: {floor}, clean. Ceiling: white. "
+        + f"Natural light from {light}. "
+        + f"Empty clean room. {SCENIC_CONFIG}."
+    )
 
 
 def _build_stage2_prompt(base: str, fpc: str, fpf: str,
                           keywords: list, spatial: str, is_bathroom: bool,
                           style_dna: dict | None = None,
-                          budget: int = 3000) -> str:
+                          budget: int = 3000,
+                          room_type: str = "",
+                          interventions: list | None = None) -> str:
     """
-    Stage 2 v24 — Catchy Airbnb Staging:
-    Combina mandatory_visual_keywords (dal preventivo) con Catchy Layer fisso
-    e Style DNA. Budget-driven: reface se basso, replace IKEA se alto.
+    Stage 2 v24.1 — Catchy Airbnb Staging:
+    Budget-driven + Style DNA + Catchy Layer + Lifestyle Staging
     """
-    dna = style_dna or {}
+    dna    = style_dna or {}
+    ivs    = interventions or []
+    is_kitchen = "cucina" in room_type.lower() or "kitchen" in room_type.lower()
     paint_target = fpc or "warm white"
 
-    # ── Conferma pareti dallo Stage 1 (ancora il modello) ────────────────────
-    wall_confirm = (
-        f"This room has fresh {paint_target} {fpf} painted walls. "
-        "Walls are perfectly clean with zero traces of previous colors. "
+    # Conferma superfici rifatte (ancora il modello allo Stage 2)
+    surface_confirm = (
+        f"The room surfaces are freshly renovated: {paint_target} {fpf} walls, "
+        "all tiles covered with micro-cement, all cabinet doors repainted. "
+        "Zero traces of previous blue, aqua, yellow, or patterned finishes. "
     )
 
-    # ── Mandatory keywords dal preventivo (Cost-to-Prompt) ───────────────────
+    # Cost-to-Prompt: keyword dal preventivo
     kw_block = ""
     if keywords:
-        kw_block = "BUDGET INTERVENTIONS TO VISUALIZE: " + ". ".join(keywords) + ". "
+        kw_block = "VISUALIZE THESE BUDGET ITEMS: " + ". ".join(keywords[:6]) + ". "
 
-    # ── Spatial map (evita mobili che bloccano elementi fissi) ───────────────
-    spatial_block = f"SPATIAL LAYOUT: {spatial}. " if spatial else ""
+    spatial_block = f"LAYOUT: {spatial}. " if spatial else ""
 
-    # ── Budget-driven logic ───────────────────────────────────────────────────
-    if budget < 3000:
-        budget_directive = (
-            "BUDGET MODE — REFACE: Keep existing furniture structure. "
-            "Recolor surfaces: paint cabinet doors white, apply adhesive film. "
-            "Focus on accessories and textiles to refresh the look. "
-        )
-    else:
-        furniture = dna.get("furniture", "modern IKEA furniture, clean lines")
-        budget_directive = (
-            f"FULL STAGING MODE: Add new furniture — {furniture}. "
-            "Replace dated pieces with clean modern equivalents. "
-        )
-
-    # ── Catchy Airbnb Layer (fisso, sempre presente) ─────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # BAGNO
+    # ═══════════════════════════════════════════════════════════════════════════
     if is_bathroom:
-        catchy = (
-            "BATHROOM STAGING: Add IKEA GODMORGON white floating vanity. "
-            "Large rectangular frameless mirror. "
-            "Neatly rolled white towels stacked on shelf. "
-            "Small succulent plant in white ceramic pot. "
-            "Matte black minimalist accessories (soap dispenser, towel ring, toilet brush). "
-            "Scented candle on vanity edge. "
+        has_sanitari = any(
+            any(k in (iv.get("titolo","") + iv.get("dettaglio","")).lower()
+                for k in ["wc", "bidet", "sanitari", "lavandino"])
+            for iv in ivs
+        )
+        fixtures = (
+            "NEW FIXTURES: Wall-hung white ceramic toilet and bidet (modern design). "
+            "Floating wood-finish vanity unit with integrated white ceramic sink. "
+            "Matte black designer faucets on sink and bathtub. "
+        ) if has_sanitari else (
+            "Existing bathtub repainted white. White sink with new matte black faucet. "
+        )
+
+        staging = (
+            "BATHROOM STAGING: "
+            "Large round frameless mirror or round black-framed mirror above vanity. "
+            "3 neatly rolled white fluffy towels stacked on shelf. "
+            "Small succulent or air plant in white ceramic pot on vanity. "
+            "Matte black soap dispenser and toothbrush holder. "
+            "Scented candle in glass jar on edge of bathtub. "
+            "Minimal wooden bath tray across bathtub. "
+        )
+        end = f"Bright, clean, spa-like atmosphere. {SCENIC_CONFIG}."
+        return surface_confirm + kw_block + fixtures + staging + end
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # CUCINA
+    # ═══════════════════════════════════════════════════════════════════════════
+    if is_kitchen:
+        cabinet_color = "sage green matte" if "verde" in " ".join(
+            iv.get("dettaglio","") for iv in ivs).lower() else "warm white matte"
+
+        has_new_appliances = any(
+            any(k in (iv.get("titolo","") + iv.get("dettaglio","")).lower()
+                for k in ["forno", "piano cottura", "induzione", "lavello"])
+            for iv in ivs
+        )
+        appliances = (
+            "NEW APPLIANCES: Built-in stainless steel induction hob and oven. "
+            "Stainless steel undermount sink with matte black faucet. "
+        ) if has_new_appliances else (
+            "Existing appliances kept, fridge clean and white. "
+        )
+
+        has_bar = any(
+            "bancone" in (iv.get("titolo","") + iv.get("dettaglio","")).lower()
+            for iv in ivs
+        )
+        bar_cmd = (
+            "Small natural wood breakfast bar with 2 rattan bar stools. "
+        ) if has_bar else ""
+
+        staging = (
+            "KITCHEN LIFESTYLE STAGING: "
+            f"Cabinets now {cabinet_color} with natural wood handles. "
+            + appliances +
+            "Open wooden shelves with: white ceramic bowls stacked, "
+            "small potted fresh herbs (basil, rosemary) on windowsill, "
+            "wooden cutting board leaning against backsplash. "
+            + bar_cmd +
+            "Rattan pendant lamp above work area. "
+            "Natural linen curtain on balcony door. "
+        )
+        end = f"Modern functional kitchen, magazine-ready. {SCENIC_CONFIG}."
+        return surface_confirm + kw_block + staging + end
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ALTRI AMBIENTI
+    # ═══════════════════════════════════════════════════════════════════════════
+    wall_confirm = (
+        f"Fresh {paint_target} {fpf} painted walls. "
+        "Zero traces of previous yellowed or patterned finishes. "
+    )
+
+    furniture = dna.get("furniture", "modern IKEA furniture")
+    textiles  = dna.get("textiles",  "linen cushions, soft throw")
+    plants    = dna.get("plants",    "Monstera in ceramic pot")
+    props     = dna.get("props",     "ceramic vase, art print")
+    lighting  = dna.get("lighting",  "warm floor lamp 2700K")
+
+    if budget >= 3000:
+        budget_directive = (
+            f"FULL REPLACEMENT: {furniture}. "
+            "Remove all dated pieces, place only new modern equivalents. "
         )
     else:
-        textiles  = dna.get("textiles",  "linen cushions, soft throw blanket")
-        plants    = dna.get("plants",    "Monstera deliciosa in ceramic pot")
-        props     = dna.get("props",     "design magazine, ceramic vase, minimalist art print")
-        lighting  = dna.get("lighting",  "warm floor lamp 2700K")
-        catchy = (
-            "CATCHY AIRBNB LAYER — ADD ALL OF THESE: "
-            f"Textiles: {textiles}, minimum 4 cushions with mixed textures (linen, velvet, bouclé). "
-            f"Statement plant: {plants}, positioned in corner or beside sofa. "
-            f"Props: {props}, neatly arranged on table surface. "
-            f"Lighting: {lighting}, switched on creating warm ambient glow. "
-            "Natural fiber rug anchoring the seating zone. "
-            "Everything styled for a magazine photoshoot. "
+        budget_directive = (
+            "REFACE MODE: Keep structural furniture, recolor surfaces. "
+            "Add accessories and textiles to refresh. "
         )
 
-    end_cmd = f"Scene is fully styled and photoshoot-ready. {SCENIC_CONFIG}."
+    catchy = (
+        "CATCHY AIRBNB LAYER: "
+        f"Sofa with {textiles} — minimum 5 cushions mixed linen/velvet/bouclé. "
+        f"Statement plant: {plants} in corner. "
+        f"Props: {props} on coffee table — open art book, ceramic vase with pampas grass. "
+        f"Lighting: {lighting} switched on, warm amber glow. "
+        "Natural jute rug anchoring seating area. "
+        "Macramé wall hanging above sofa. "
+        "Sheer linen curtains on windows. "
+        "Everything magazine-styled, Airbnb hero-shot ready. "
+    )
 
-    return wall_confirm + kw_block + spatial_block + budget_directive + catchy + end_cmd
+    end = f"Scene fully styled and photoshoot-ready. {SCENIC_CONFIG}."
+    return wall_confirm + kw_block + spatial_block + budget_directive + catchy + end
+
+
 
 
 
