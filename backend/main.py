@@ -6,6 +6,7 @@ import base64
 import traceback
 import uuid
 import asyncio
+from pydantic import BaseModel
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from ai_service import (
@@ -20,7 +21,7 @@ app = FastAPI(title="HomeStager AI")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # wildcard per lab sandbox + localhost + Vercel
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -57,7 +58,6 @@ async def analyze(
             "content_type": photo.content_type or "image/jpeg",
         })
 
-    # ── PhotoValidator — analisi qualità prima di avviare il job ──────────────
     validation = await validate_input_photos(photo_data)
     invalid_photos = [
         {"index": i, "issue": validation["issues"][i], "suggestion": validation.get("suggestions", [""])[i]}
@@ -70,7 +70,6 @@ async def analyze(
         "status": "processing",
         "progress": 0,
         "step": "Inizializzazione…",
-        # Esponi i warning di validazione subito nel job — il frontend può mostrarli
         "validation": {
             "warnings":       validation.get("warnings", []),
             "invalid_photos": invalid_photos,
@@ -86,8 +85,8 @@ async def analyze(
     }
     background_tasks.add_task(_process_job, job_id, photo_data, prefs, email)
     return {
-        "job_id":    job_id,
-        "validation": jobs[job_id]["validation"],   # restituisce subito i warning
+        "job_id":     job_id,
+        "validation": jobs[job_id]["validation"],
     }
 
 
@@ -106,11 +105,6 @@ async def test_variant(
     negative_prompt: str = Form(""),
     guidance_scale: float = Form(25.0),
 ):
-    """
-    Endpoint di test per la sandbox di configurazione.
-    Chiama Imagen direttamente senza pipeline completa.
-    guidance_scale cappato a 30 (>30 = 0 immagini silenzioso).
-    """
     guidance_scale = min(float(guidance_scale), 30.0)
     content = await photo.read()
 
@@ -144,14 +138,38 @@ async def test_variant(
 
         return {
             "success": False,
-            "error": f"Imagen ha restituito 0 immagini (guidance={guidance_scale}). "
-                     "Prova un valore <= 28.",
+            "error": f"Imagen ha restituito 0 immagini (guidance={guidance_scale}). Prova un valore <= 28.",
         }
 
     except Exception as e:
         tb = traceback.format_exc()
         print(f"[test-variant] ERRORE:\n{tb}")
         return {"success": False, "error": f"{type(e).__name__}: {e}"}
+
+
+class StageImageRequest(BaseModel):
+    photo_b64: str
+    photo_mime: str
+    prompt: str
+
+
+@app.post("/stage-image")
+async def stage_image(req: StageImageRequest):
+    try:
+        photo_bytes = base64.b64decode(req.photo_b64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="photo_b64 non valido")
+
+    from ai_service import _approach_C_edit
+    loop = asyncio.get_running_loop()
+    result_b64 = await loop.run_in_executor(
+        None, _approach_C_edit, photo_bytes, req.prompt, 26, "DEMO"
+    )
+
+    if not result_b64:
+        raise HTTPException(status_code=500, detail="Generazione immagine fallita — controlla i log Cloud Run")
+
+    return {"image_b64": result_b64}
 
 
 async def _process_job(job_id: str, photos: list, prefs: dict, email: str):
@@ -195,23 +213,3 @@ async def _process_job(job_id: str, photos: list, prefs: dict, email: str):
             "traceback": tb,
             "validation": jobs[job_id].get("validation", {}),
         }
-        from fastapi import Body
-
-import base64
-
-@app.post("/stage-image")
-async def stage_image(
-    photo_b64: str = Body(...),
-    photo_mime: str = Body(...),
-    prompt: str = Body(...),
-):
-    from ai_service import _approach_C_edit
-    import asyncio
-    loop = asyncio.get_running_loop()
-    photo_bytes = base64.b64decode(photo_b64)
-    result_b64 = await loop.run_in_executor(
-        None, _approach_C_edit, photo_bytes, prompt, 26, "DEMO"
-    )
-    if not result_b64:
-        raise HTTPException(status_code=500, detail="Generazione immagine fallita")
-    return {"image_b64": result_b64}
