@@ -1,17 +1,29 @@
 """
-AI Service v21 — E_WALL_FORCE single-stage
+AI Service v22 — E_WALL_FORCE Two-Stage "Interior Designer Engine"
 
-Architettura:
-  - D_FULL_SMART: DISABILITATO (riattivare rimuovendo il 'continue')
-  - E_WALL_FORCE: single-stage, 1 chiamata per stanza (4 stanze = 4 call totali)
-      guidance=15, solid opaque coating, protezione bagni anti-finestre-fantasma
+Unica variante attiva: E_WALL_FORCE in modalità two-stage.
+D_FULL_SMART: rimosso completamente.
 
-Rispetto a v17:
-  - Two-stage rimosso → da 16 chiamate a 4 per job
-  - Semaforo reale: il task parte solo quando il worker è libero
-  - is_bathroom: no finestre aggiuntive, piastrelle come elementi strutturali
-  - Retry 2× con backoff 15s
-  - Guidance Stage1 14→15, Stage2 eliminato (single-stage)
+Stage 1 — The Canvas (guidance=16):
+  Force-paint template: copre al 100% i colori originali con solid opaque coating.
+  Svuota la stanza dai mobili brutti/ingombranti. Risultato: "scatola vuota" pulita.
+
+Stage 2 — The Staging (guidance=12):
+  Catchy layering: tessili ricchi, piante (Monstera/Strelitzia), lampade 2700K,
+  quadri minimalisti. Prompt costruito da mandatory_visual_keywords generati da Gemini
+  in base agli interventi del preventivo (Cost-to-Prompt sincronizzato).
+
+Protocollo budget:
+  - budget_action = "remove": mobile brutto eliminato, parete vuota e luminosa.
+  - budget_action = "replace": rimpiazzato con modello IKEA specifico.
+  - budget_action = "reface": cucine/bagni → cambio colore ante o micro-cement.
+
+Protezione strutturale:
+  - Frigo, sanitari, docce: mai rimossi sotto €5000/stanza.
+  - Bagni: no finestre fantasma, piastrelle trattate come struttura.
+
+Chiamate Imagen: N_stanze × 2 (Stage1 + Stage2). Con 4 stanze = 8 call totali.
+Semaforo reale: max 2 task simultanei, retry 2× con backoff 15s.
 """
 import asyncio
 import base64
@@ -52,12 +64,8 @@ GEMINI_URL = (
 # D: Stage1=8  (libertà massima), Stage2=10
 # E: Stage1=14 (aggressivo sul colore pareti), Stage2=10
 GUIDANCE = {
-    "C4_FULL":          25,
-    "C5_SMART_FULL":    22,
-    "D_STAGE1_CLEAN":    8,
-    "D_STAGE2_STAGE":   10,
-    "E_STAGE1_WALL":    15,   # alzato a 15: forza copertura colore pareti originale
-    "E_STAGE2_STAGE":   12,   # alzato a 12: più dettaglio nell'arredo finale
+    "E_STAGE1_CANVAS":  16,   # Force-paint: copre colori originali al 100%
+    "E_STAGE2_STAGING": 12,   # Catchy layering: fotorealismo + arredo
 }
 
 _vertex_client = None
@@ -237,28 +245,41 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
     }
 
     system_instruction = (
-        "Sei un Interior Designer senior e fotografo di interni specializzato in home staging. "
-        "Prima di generare qualsiasi prompt Imagen, esegui una MAPPATURA SPAZIALE: "
-        "1) Identifica la posizione della sorgente luminosa principale. "
-        "2) Identifica i materiali esistenti (pavimento, pareti, soffitto). "
-        "3) Stima la direzione delle ombre portate. "
-        "4) Identifica il COLORE ESATTO delle pareti attuali (es. 'giallo paglierino', "
-        "'beige opaco', 'bianco sporco') — questa informazione è critica per la variante E. "
-        "5) Identifica se la stanza è un BAGNO tramite il campo 'is_bathroom'.\n\n"
-        "REGOLE FERREE v21:\n"
-        "PROTOCOLLO BAGNO: Se is_bathroom=true, è VIETATO aggiungere finestre non visibili "
-        "nella foto originale. Le piastrelle esistenti sono elementi strutturali: non vanno "
-        "rimosse ma ricolorate con 'tile paint' o coperte con 'micro-cement finish overlay'. "
-        "Non mettere mai finestre fittizie in un bagno interno.\n"
-        "PITTURA PARETI: Nei prompt usa sempre 'solid opaque structural coating' per coprire "
-        "il colore originale. Mai 'paint over' o 'repaint' da soli — aggiungere sempre "
-        "'zero bleed-through, 100% opacity, no original color visible'.\n"
-        "COERENZA COSTI: Ogni elemento aggiunto nel rendering (piastrelle, mobili, luci) "
-        "DEVE avere una voce corrispondente in 'interventi' con costo_min e costo_max.\n"
-        "I prompt_en devono includere 'consistent shadows', 'global illumination', "
-        "'ambient occlusion' per evitare l'effetto sticker. "
-        "detected_elements elenca SOLO cio' che e' fisicamente visibile. "
-        "Rispondi ESCLUSIVAMENTE con un oggetto JSON valido, senza markdown ne' backtick."
+        "Sei un Interior Designer e Fotografo Real Estate senior. "
+        "Il tuo obiettivo è massimizzare il CTR su Airbnb/Booking.\n\n"
+
+        "STEP 1 — ANALISI SPAZIALE per ogni foto:\n"
+        "  a) Identifica la sorgente luminosa principale e la direzione delle ombre.\n"
+        "  b) Mappa i volumi: se un mobile blocca un elemento fisso (es. letto davanti "
+        "all'armadio), pianifica il riposizionamento.\n"
+        "  c) Identifica il COLORE ESATTO delle pareti attuali (es. 'giallo paglierino opaco') "
+        "— critico per il Force-Paint dello Stage 1.\n"
+        "  d) Identifica se è un bagno (is_bathroom=true): piastrelle = struttura, mai rimuoverle.\n\n"
+
+        "STEP 2 — VALUTAZIONE ESTETICA E BUDGET:\n"
+        "  Per ogni mobile/elemento visibile, decidi una budget_action:\n"
+        "  • 'remove'  → mobile brutto o ingombrante, budget basso: eliminalo. "
+        "Meglio vuoto e luminoso che pieno di obsoleto.\n"
+        "  • 'replace' → budget sufficiente: rimpiazza con modello IKEA specifico.\n"
+        "  • 'reface'  → cucine/bagni: cambia colore ante o applica micro-cement. "
+        "Non rimuovere mai frigo, lavandini, docce sotto €5000 budget stanza.\n"
+        "  • 'keep'    → elemento neutro o di qualità: mantieni.\n\n"
+
+        "STEP 3 — GENERA mandatory_visual_keywords:\n"
+        "  Lista di keyword Imagen che DERIVANO DIRETTAMENTE dagli interventi del preventivo. "
+        "Se nel preventivo c'è 'Pittura grigio perla', la keyword DEVE essere "
+        "'matte warm grey walls'. Se c'è 'Divano IKEA FRIHETEN grigio chiaro', la keyword "
+        "DEVE essere 'light grey fabric sofa IKEA style'. "
+        "REGOLA: ogni voce di costo ha una keyword visiva corrispondente.\n\n"
+
+        "STEP 4 — COSTRUISCI I PROMPT:\n"
+        "  Stage 1 (The Canvas): solo pareti + pavimento + rimozione mobili. "
+        "Usa SEMPRE 'solid opaque [color] matte paint, zero bleed-through, 100% opacity'.\n"
+        "  Stage 2 (The Staging): aggiungi SOLO arredi da mandatory_visual_keywords. "
+        "Chiudi SEMPRE con: 'professional real estate photography, 24mm wide angle, "
+        "HDR, perfectly balanced exposure, architectural digest style'.\n\n"
+
+        "Rispondi ESCLUSIVAMENTE con un oggetto JSON valido, senza markdown né backtick."
     )
 
     foto_index_list = "\n".join(
@@ -327,7 +348,22 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         "      \"indice_foto\": 0,\n"
         "      \"room_type\": \"bagno|cucina|camera|soggiorno|balcone|altro\",\n"
         "      \"is_bathroom\": false,\n"
-        "      \"detected_elements\": [\"elemento visibile\", \"no windows visible se assenti\"],\n"
+        "      \"current_wall_color\": \"es. giallo paglierino opaco\",\n"
+        "      \"force_paint_color\": \"es. warm grey matte\",\n"
+        "      \"force_paint_finish\": \"es. matte|satin|micro-cement\",\n"
+        "      \"floor_description\": \"es. light oak parquet\",\n"
+        "      \"light_source\": \"es. window left, diffuse daylight\",\n"
+        "      \"shadow_direction\": \"es. shadows toward right\",\n"
+        "      \"spatial_map\": \"es. wardrobe blocks window — move bed to right wall\",\n"
+        "      \"detected_elements\": [\"elemento visibile 1\", \"elemento visibile 2\"],\n"
+        "      \"mandatory_visual_keywords\": [\n"
+        "        \"solid opaque warm grey matte paint on all walls\",\n"
+        "        \"light grey fabric sofa IKEA style\",\n"
+        "        \"Monstera plant in terracotta pot\",\n"
+        "        \"black metal floor lamp warm 2700K light\",\n"
+        "        \"minimalist framed print above sofa\"\n"
+        "      ],\n"
+        "      \"detected_elements\": [\"elemento visibile\"],\n"
         "      \"current_wall_color\": \"es. giallo paglierino opaco\",\n"
         "      \"target_wall_color\": \"es. warm grey\",\n"
         "      \"target_wall_finish\": \"es. venetian plaster\",\n"
@@ -343,47 +379,22 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
         f"          \"dettaglio\": \"prodotto specifico, brand, prezzo a {location}\",\n"
         "          \"costo_min\": 50, \"costo_max\": 120,\n"
         "          \"priorita\": \"alta\",\n"
+        "          \"budget_action\": \"remove|replace|reface|keep\",\n"
         f"          \"dove_comprare\": \"negozio coerente con {style}\"\n"
         "        }}\n"
         "      ],\n"
         "      \"costo_totale_stanza\": 350,\n"
         "      \"esperimenti_staged\": [\n"
         "        {{\n"
-        "          \"logic_id\": \"D_FULL_SMART\",\n"
-        "          \"guidance_scale_stage1\": 8,\n"
-        "          \"guidance_scale_stage2\": 10,\n"
-        "          \"prompt_stage1\": \"Empty, clean room. Remove all furniture and clutter. Keep structure: [target_wall_finish] [target_wall_color] walls, [pavimento originale]. Photorealistic, consistent lighting matching [light_source], 8k.\",\n"
-        f"          \"prompt_stage2\": \"[Stanza vuota con [target_wall_finish] [target_wall_color] walls]. Add: [tappeto design] on [pavimento]. [Mobile principale se funzionale] with [3-4 cuscini texture misti]. Add: [mensola metallo nero con luci Edison]. Hang: [2 stampe cornici nere]. Corner: [Monstera in vaso terracotta]. Add: [lampada a stelo metallo nero]. Realistic fabric folds, reflections on polished surfaces, soft shadows matching [light_source], consistent shadows, global illumination, ambient occlusion, depth of field f/8, ray tracing, HDR. Professional real estate photography, 24mm wide angle lens, cinematic warm lighting, 8k.\",\n"
-        "          \"interventi_lista\": [\n"
-        "            {{\"voce\": \"Finitura pareti [target_wall_finish]\", \"costo\": 400}},\n"
-        "            {{\"voce\": \"Tappeto design — H&M Home\", \"costo\": 120}},\n"
-        "            {{\"voce\": \"Cuscini 5 pz — Zara Home\", \"costo\": 80}},\n"
-        "            {{\"voce\": \"Mensola metallo nero + luci Edison\", \"costo\": 90}},\n"
-        "            {{\"voce\": \"2 stampe + cornici nere IKEA FISKBO\", \"costo\": 40}},\n"
-        "            {{\"voce\": \"Pianta Monstera + vaso terracotta\", \"costo\": 45}},\n"
-        "            {{\"voce\": \"Lampada a stelo metallo nero\", \"costo\": 60}}\n"
-        "          ],\n"
-        "          \"costo_simulato\": 835\n"
-        "        }},\n"
-        "        {{\n"
         "          \"logic_id\": \"E_WALL_FORCE\",\n"
-        "          \"guidance_scale_stage1\": 14,\n"
-        "          \"guidance_scale_stage2\": 10,\n"
-        "          \"current_wall_color\": \"[colore esatto pareti attuali da current_wall_color]\",\n"
-        "          \"target_wall_color\": \"[nuovo colore da target_wall_color]\",\n"
-        "          \"target_wall_finish\": \"[finitura da target_wall_finish]\",\n"
-        "          \"prompt_stage1\": \"Complete architectural renovation. The original [current_wall_color] wall color MUST be entirely replaced. All walls are now [target_wall_finish] [target_wall_color]. Solid, opaque paint, no transparency, no bleed-through, no traces of [current_wall_color] visible anywhere. Empty room, no furniture. Consistent lighting matching [light_source]. Photorealistic, 8k.\",\n"
-        f"          \"prompt_stage2\": \"The room is now perfectly clean with new [target_wall_finish] [target_wall_color] walls from Stage 1. These walls show no trace of the previous [current_wall_color]. On these new walls: [tappeto design] on [pavimento]. [Mobile principale se funzionale] with [3-4 cuscini texture misti]. [mensola metallo nero con luci Edison] against the wall. [2 stampe cornici nere] hung above. Corner: [Monstera in vaso terracotta]. [lampada a stelo metallo nero] for warm atmosphere. Soft shadows matching [light_source], consistent shadows, global illumination, ambient occlusion, depth of field f/8, ray tracing, HDR. Professional real estate photography, 24mm wide angle lens, cinematic warm lighting, balanced exposure, highly detailed, 8k.\",\n"
+        "          \"prompt_stage1\": \"Empty room. The original [current_wall_color] walls are now covered with solid opaque [force_paint_finish] [force_paint_color] coating. Zero bleed-through. 100% opacity. No original color visible. Floor is [floor_description], clean. No furniture. Light from [light_source]. Consistent lighting, photorealistic, 8k.\",\n"
+        "          \"prompt_stage2\": \"[mandatory_visual_keywords joined as scene description]. [spatial_map arrangement]. Layering: textured cushions mix (linen, velvet, cotton), statement plant (Monstera or Strelitzia) in ceramic pot, warm 2700K floor lamp, minimalist framed art print. professional real estate photography, 24mm wide angle, HDR, perfectly balanced exposure, architectural digest style.\",\n"
         "          \"interventi_lista\": [\n"
-        "            {{\"voce\": \"Tinteggiatura [target_wall_finish] [target_wall_color]\", \"costo\": 400}},\n"
-        "            {{\"voce\": \"Tappeto design — H&M Home\", \"costo\": 120}},\n"
-        "            {{\"voce\": \"Cuscini 5 pz — Zara Home\", \"costo\": 80}},\n"
-        "            {{\"voce\": \"Mensola metallo nero + luci Edison\", \"costo\": 90}},\n"
-        "            {{\"voce\": \"2 stampe + cornici nere IKEA FISKBO\", \"costo\": 40}},\n"
-        "            {{\"voce\": \"Pianta Monstera + vaso terracotta\", \"costo\": 45}},\n"
-        "            {{\"voce\": \"Lampada a stelo metallo nero\", \"costo\": 60}}\n"
+        "            {{\"voce\": \"Pittura pareti [force_paint_color]\", \"costo\": 400}},\n"
+        "            {{\"voce\": \"Arredo principale\", \"costo\": 500}},\n"
+        "            {{\"voce\": \"Tessili e decor\", \"costo\": 200}}\n"
         "          ],\n"
-        "          \"costo_simulato\": 835\n"
+        "          \"costo_simulato\": 1100\n"
         "        }}\n"
         "      ]\n"
         "    }}\n"
@@ -443,63 +454,151 @@ def _gemini_sync(photos: list, prefs: dict) -> dict:
 # ── STAGED PHOTOS ─────────────────────────────────────────────────────────────
 
 async def generate_staged_photos(photos: list, analysis: dict) -> list:
-    stanze = analysis.get("stanze", [])
-    loop   = asyncio.get_running_loop()
-    all_futures = []
-
-    for i, room in enumerate(stanze):
-        idx         = room.get("indice_foto", i)
-        esperimenti = room.get("esperimenti_staged", [])
-        photo_bytes = photos[idx]["content"] if idx < len(photos) else None
-        is_bathroom = room.get("is_bathroom", False) or \
-                      room.get("room_type", "").lower() in ("bagno", "bathroom")
-        cwc = room.get("current_wall_color", "")
-
-        for esp in esperimenti:
-            logic_id = esp.get("logic_id", "")
-
-            # ── D: DISABILITATO — riattivare quando E è stabile
-            if logic_id == "D_FULL_SMART":
-                continue
-
-            # ── E: single-stage (no two-stage) — 1 chiamata per stanza invece di 2
-            # Dimezza il carico API: 4 stanze = 4 chiamate totali
-            elif logic_id == "E_WALL_FORCE":
-                # Usa prompt_stage2 come prompt finale (più ricco di dettaglio arredo)
-                prompt = esp.get("prompt_stage2", "") or esp.get("prompt_stage1", "")
-                if not prompt or not photo_bytes:
-                    continue
-                all_futures.append(("E_WALL_FORCE", i,
-                    photo_bytes, prompt, cwc, is_bathroom
-                ))
-
-    # ── Esegui in sequenza con semaforo reale (non pre-submitting) ───────────
-    sem = _get_semaphore()
+    stanze  = analysis.get("stanze", [])
     results = [{} for _ in stanze]
+    sem     = _get_semaphore()
 
-    async def _run_one(label, room_idx, photo_bytes, prompt, cwc, is_bathroom):
+    async def _run_room(i: int, room: dict):
+        idx         = room.get("indice_foto", i)
+        photo_bytes = photos[idx]["content"] if idx < len(photos) else None
+        if not photo_bytes:
+            return
+
+        is_bathroom  = room.get("is_bathroom", False) or \
+                       room.get("room_type", "").lower() in ("bagno", "bathroom")
+        cwc          = room.get("current_wall_color", "")
+        fpc          = room.get("force_paint_color", "warm white matte")
+        fpf          = room.get("force_paint_finish", "matte")
+        floor        = room.get("floor_description", "existing floor, clean")
+        light        = room.get("light_source", "natural daylight from window")
+        spatial      = room.get("spatial_map", "")
+        keywords     = room.get("mandatory_visual_keywords", [])
+
+        # ── Cerca esperimento E_WALL_FORCE nel JSON Gemini ───────────────────
+        esp = next(
+            (e for e in room.get("esperimenti_staged", []) if e.get("logic_id") == "E_WALL_FORCE"),
+            {}
+        )
+
+        # ── Build Stage 1: Force-Paint Canvas ────────────────────────────────
+        # Usa il prompt di Gemini come base; Python sovrascrive le sezioni critiche
+        s1_base = esp.get("prompt_stage1", "")
+        stage1_prompt = _build_stage1_prompt(s1_base, cwc, fpc, fpf, floor, light, is_bathroom)
+
+        # ── Build Stage 2: Catchy Layering ────────────────────────────────────
+        s2_base = esp.get("prompt_stage2", "")
+        stage2_prompt = _build_stage2_prompt(s2_base, fpc, fpf, keywords, spatial, is_bathroom)
+
+        loop = asyncio.get_running_loop()
         async with sem:
-            loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
-                _imagen_executor, _approach_E_single,
-                photo_bytes, prompt, cwc, is_bathroom
+                _imagen_executor, _approach_E_two_stage_v22,
+                photo_bytes, stage1_prompt, stage2_prompt, is_bathroom, cwc
             )
-            return label, room_idx, result
+        results[i]["E_WALL_FORCE"] = result
 
-    tasks = [
-        _run_one(label, room_idx, pb, prompt, cwc, ib)
-        for label, room_idx, pb, prompt, cwc, ib in all_futures
-    ]
-    gathered = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for item in gathered:
-        if isinstance(item, Exception):
-            print(f"[generate_staged_photos] ERRORE: {item}")
-            continue
-        label, room_idx, result = item
-        results[room_idx][label] = result
-
+    await asyncio.gather(*[_run_room(i, room) for i, room in enumerate(stanze)])
     return results
+
+
+def _build_stage1_prompt(base: str, cwc: str, fpc: str, fpf: str,
+                          floor: str, light: str, is_bathroom: bool) -> str:
+    """
+    Force-Paint Canvas: svuota la stanza e ridipinge le pareti.
+    La keyword critica 'solid opaque [color] [finish] paint' è sempre presente.
+    """
+    paint_cmd = (
+        f"The original {cwc} walls are now completely covered with "
+        f"solid opaque {fpc} {fpf} paint. "
+        if cwc else
+        f"All walls are now solid opaque {fpc} {fpf} paint. "
+    )
+    paint_cmd += "Zero bleed-through. 100% opacity. No original color visible anywhere. "
+
+    if is_bathroom:
+        # Bagni: no rimozione piastrelle, no finestre fantasma
+        room_cmd = (
+            "BATHROOM: Keep original tile layout and boundaries. "
+            "Recolor tiles with micro-cement white finish overlay. "
+            "Remove only portable objects (soap, bottles, mats). "
+            "DO NOT add windows not present in original. "
+        )
+    else:
+        room_cmd = (
+            "Remove all furniture, clutter, and obsolete objects. "
+            "Keep built-in elements (windows, doors, built-in wardrobes if modern). "
+        )
+
+    floor_cmd = f"Floor: {floor}, swept clean. "
+    light_cmd = f"Lighting: {light}, consistent, no harsh shadows. "
+    end_cmd   = "Empty room. Photorealistic, 8k resolution."
+
+    # Se Gemini ha generato un prompt base sensato, usalo come punto di partenza
+    # ma sovrascriviamo sempre la sezione pittura con il nostro template forzato
+    if base and len(base) > 30:
+        # Rimuovi eventuali istruzioni di arredo dal prompt Stage1 di Gemini
+        # (a volte Gemini mette mobili anche nello Stage1)
+        clean_base = base.split("Add:")[0].split("Place:")[0].strip().rstrip(",") + ". "
+        return paint_cmd + room_cmd + floor_cmd + light_cmd + clean_base + end_cmd
+    return paint_cmd + room_cmd + floor_cmd + light_cmd + end_cmd
+
+
+def _build_stage2_prompt(base: str, fpc: str, fpf: str,
+                          keywords: list, spatial: str, is_bathroom: bool) -> str:
+    """
+    Catchy Layering: arreda la scatola pulita con gli elementi del preventivo.
+    mandatory_visual_keywords → primo blocco del prompt.
+    Catchy layering fisso: cuscini, pianta, lampada, quadro.
+    Chiude sempre con: professional real estate photography formula.
+    """
+    # Conferma pareti (anchora Stage2 al risultato di Stage1)
+    wall_confirm = (
+        f"The room has fresh {fpc} {fpf} painted walls from the renovation. "
+        f"These walls show no trace of any previous color. "
+    )
+
+    # Keyword dal preventivo (Cost-to-Prompt)
+    kw_block = ""
+    if keywords:
+        kw_block = " ".join(keywords) + ". "
+
+    # Spatial map
+    spatial_block = f"{spatial}. " if spatial else ""
+
+    # Catchy layering fisso
+    if is_bathroom:
+        layering = (
+            "Add: IKEA GODMORGON white floating vanity with integrated sink. "
+            "Large rectangular mirror with thin frame above. "
+            "Rolled white towels on shelf. Small succulent plant in white pot. "
+            "Minimal matte black accessories (soap dispenser, towel ring). "
+        )
+    else:
+        layering = (
+            "Layering: 5 textured cushions mix (linen, velvet, bouclé) on sofa. "
+            "Statement plant — Monstera deliciosa or Strelitzia in large ceramic pot. "
+            "Warm 2700K floor lamp with black metal stem. "
+            "Two minimalist framed art prints on wall. "
+            "Natural fiber rug (jute or wool) anchoring the seating area. "
+        )
+
+    end_cmd = (
+        "professional real estate photography, 24mm wide angle lens, "
+        "HDR, perfectly balanced exposure, soft natural light, "
+        "global illumination, consistent shadows, architectural digest style."
+    )
+
+    # Se Gemini ha un prompt Stage2 base, prendi solo la parte degli arredi specifici
+    extra = ""
+    if base and len(base) > 30:
+        # Estrai solo la parte degli arredi (prima delle keyword di fotografia)
+        clean = base.split("professional real estate")[0].strip().rstrip(",") + ". "
+        # Evita duplicazione con keywords già incluse
+        extra = clean if len(clean) > 30 else ""
+
+    return wall_confirm + kw_block + spatial_block + extra + layering + end_cmd
+
+
 
 
 # ── Core: singola chiamata (C4, C5) ──────────────────────────────────────────
@@ -648,7 +747,103 @@ def _approach_D_two_stage(photo_bytes: bytes,
                 return None
 
 
-# ── Core: E single-stage ─────────────────────────────────────────────────────
+# ── Core: E two-stage v22 ────────────────────────────────────────────────────
+
+def _approach_E_two_stage_v22(photo_bytes: bytes,
+                               stage1_prompt: str, stage2_prompt: str,
+                               is_bathroom: bool = False,
+                               current_wall_color: str = "") -> str | None:
+    """
+    Stage 1 (guidance=16): Force-Paint Canvas — svuota + ridipinge pareti.
+    Stage 2 (guidance=12): Catchy Layering — arreda con mandatory_visual_keywords.
+    Retry 2× con backoff 15s per ogni stage.
+    """
+    import time
+
+    neg_s1 = (
+        "furniture, objects, clutter, trash bags, cables, "
+        "original wall color, bleed-through, transparent paint, "
+        "color bleeding, previous paint showing through, "
+        "distorted architecture, watermark, low quality, unrealistic"
+    )
+    if current_wall_color:
+        neg_s1 += f", {current_wall_color}, {current_wall_color} walls"
+    if is_bathroom:
+        neg_s1 += ", added windows, fake windows, exterior view, removed tiles"
+
+    neg_s2 = (
+        "empty room, bare walls, clutter, trash bags, "
+        "original wall color retained, bleed-through, "
+        "dark shadows, overexposed, noise, cartoon, "
+        "floating objects, sticker effect, inconsistent shadows, "
+        "distorted architecture, watermark"
+    )
+    if is_bathroom:
+        neg_s2 += ", added windows, fake windows, exterior view, missing tiles"
+
+    bath_tag = " [BAGNO]" if is_bathroom else ""
+    g1 = GUIDANCE["E_STAGE1_CANVAS"]
+    g2 = GUIDANCE["E_STAGE2_STAGING"]
+
+    def _call_imagen(prompt: str, ref_bytes: bytes, guidance: float,
+                     neg: str, tag: str) -> bytes | None:
+        for attempt in range(1, 3):
+            try:
+                compressed = compress_image(ref_bytes, max_width=1024, quality=80)
+                print(f"[{tag}] attempt={attempt} {len(compressed)//1024}KB g={guidance}")
+                client = _get_vertex_client()
+                resp = client.models.edit_image(
+                    model="imagen-3.0-capability-001",
+                    prompt=prompt,
+                    reference_images=[
+                        genai_types.RawReferenceImage(
+                            reference_id=1,
+                            reference_image=genai_types.Image(image_bytes=compressed),
+                        )
+                    ],
+                    config=genai_types.EditImageConfig(
+                        edit_mode="EDIT_MODE_DEFAULT",
+                        number_of_images=1,
+                        guidance_scale=float(guidance),
+                        negative_prompt=neg,
+                        safety_filter_level="block_only_high",
+                    ),
+                )
+                if resp.generated_images:
+                    print(f"[{tag}] SUCCESS attempt={attempt}")
+                    return resp.generated_images[0].image.image_bytes
+                print(f"[{tag}] 0 immagini (g={guidance}) — safety filter o quota")
+                return None
+            except Exception as e:
+                print(f"[{tag}] ERRORE attempt={attempt}: {type(e).__name__}: {e}")
+                if attempt < 2:
+                    print(f"[{tag}] retry tra 15s…")
+                    time.sleep(15)
+                else:
+                    return None
+
+    # Stage 1
+    s1_bytes = _call_imagen(
+        stage1_prompt, photo_bytes, g1, neg_s1,
+        f"E-S1{bath_tag}"
+    )
+    if s1_bytes is None:
+        print(f"[E-S1] FALLITO — uso foto originale come fallback per Stage2")
+        s1_bytes = compress_image(photo_bytes, max_width=1024, quality=80)
+
+    # Stage 2
+    s2_bytes = _call_imagen(
+        stage2_prompt, s1_bytes, g2, neg_s2,
+        f"E-S2{bath_tag}"
+    )
+    if s2_bytes is None:
+        print("[E-S2] FALLITO — nessuna immagine per questa stanza")
+        return None
+
+    return base64.b64encode(s2_bytes).decode()
+
+
+
 # Una sola chiamata per stanza: prompt ricco con wall recolor + arredo.
 # Guidance=15 → trasformazione decisa ma ancora ancorata alla foto originale.
 
