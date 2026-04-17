@@ -182,11 +182,11 @@ async def stage_image(req: StageImageRequest):
     except Exception:
         raise HTTPException(status_code=400, detail="photo_b64 non valido")
 
-    from ai_service import _approach_C_edit
+    from ai_service import _approach_single
     loop = asyncio.get_running_loop()
     try:
         result_b64 = await loop.run_in_executor(
-            None, _approach_C_edit, photo_bytes, req.prompt, 26, "DEMO"
+            None, _approach_single, photo_bytes, req.prompt, 26, "DEMO"
         )
     except Exception as e:
         tb = traceback.format_exc()
