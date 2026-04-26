@@ -1,242 +1,191 @@
 """
-HomeStager AI — FastAPI Backend v18
-Pipeline: Upload → PhotoValidator → Gemini 2.5 Flash → Imagen 3 → WeasyPrint PDF → SendGrid2
+HomeStager AI — FastAPI Backend (Secure v2)
+- X-Staged-Token header authentication
+- Firestore credit verification before every AI call (server-side)
+- Gemini API key never leaves the server
+- /stage-image : Imagen/Gemini image generation
+- /gemini-analyze : Gemini analysis proxy (consumes 1 credit)
+- /gemini-translate : translation proxy (no credit)
+- /gemini-products : product suggestions proxy (no credit)
 """
-import base64
-import traceback
-import uuid
-import asyncio
-from pydantic import BaseModel
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
+import os
+import httpx
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from ai_service import (
-    analyze_with_gemini, generate_staged_photos,
-    validate_input_photos, compress_image, _get_vertex_client,
-)
-from pdf_service import generate_pdf
-from email_service import send_report_email
-from google.genai import types as genai_types
+from pydantic import BaseModel
 
-app = FastAPI(title="HomeStager AI")
+# ── Firebase Admin ────────────────────────────────────────────────────────
+import firebase_admin
+from firebase_admin import credentials, firestore as fb_firestore
+
+if not firebase_admin._apps:
+    firebase_admin.initialize_app()   # uses Cloud Run default service account
+db = fb_firestore.client()
+
+# ── Env config ────────────────────────────────────────────────────────────
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+STAGED_SECRET  = os.environ.get("STAGED_SECRET", "")
+GEMINI_BASE    = "https://generativelanguage.googleapis.com/v1beta/models"
+
+app = FastAPI(title="HomeStager AI Secure")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:5173",
+        "https://gestione-affitti-brevi-milano.it",
+        "https://www.gestione-affitti-brevi-milano.it",
+        "https://staged-ai-six.vercel.app",
+    ],
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*", "X-Staged-Token", "X-User-UID"],
 )
 
-# Aggiunge CORS anche alle risposte di errore (500, 422 ecc.)
-# Necessario per chiamate da file:// dove l'origin è "null"
-@app.middleware("http")
-async def force_cors(request, call_next):
-    response = await call_next(request)
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    return response
+# ── Helpers ───────────────────────────────────────────────────────────────
 
-@app.exception_handler(Exception)
-async def generic_exception_handler(request, exc):
-    from fastapi.responses import JSONResponse
-    import traceback
-    tb = traceback.format_exc()
-    print(f"[unhandled] {tb}")
-    return JSONResponse(
-        status_code=500,
-        content={"detail": f"{type(exc).__name__}: {exc}"},
-        headers={"Access-Control-Allow-Origin": "*"},
-    )
+def verify_token(request: Request):
+    if not STAGED_SECRET:
+        return  # skip in dev if not set
+    if request.headers.get("X-Staged-Token", "") != STAGED_SECRET:
+        raise HTTPException(status_code=401, detail="Token non valido.")
 
-jobs: dict = {}
 
+def consume_credit(uid: str):
+    """Decrement credit in Firestore transaction. Raises 402 if out of credits."""
+    if not uid:
+        raise HTTPException(status_code=401, detail="UID utente mancante.")
+    user_ref = db.collection("users").document(uid)
+
+    @fb_firestore.transactional
+    def _txn(transaction, ref):
+        snap = ref.get(transaction=transaction)
+        if not snap.exists:
+            raise HTTPException(status_code=403, detail="Utente non trovato.")
+        credits = snap.to_dict().get("credits", 0)
+        if credits <= 0:
+            raise HTTPException(status_code=402,
+                detail="Crediti esauriti. Contatta l'amministratore.")
+        transaction.update(ref, {"credits": fb_firestore.Increment(-1)})
+        return credits - 1
+
+    txn = db.transaction()
+    return _txn(txn, user_ref)
+
+
+async def call_gemini(model: str, payload: dict, timeout: float = 120.0) -> dict:
+    url = f"{GEMINI_BASE}/{model}:generateContent?key={GEMINI_API_KEY}"
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(url, json=payload,
+                                 headers={"Content-Type": "application/json"})
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
+    return resp.json()
+
+
+# ── Models ────────────────────────────────────────────────────────────────
+
+class GeminiReq(BaseModel):
+    payload: dict
+    model: str = "gemini-2.5-flash"
+    consume_credit: bool = True
+
+class StageImageReq(BaseModel):
+    photo_b64: str
+    photo_mime: str = "image/jpeg"
+    prompt: str
+
+class TranslateReq(BaseModel):
+    text: str
+
+# ── Endpoints ─────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok",
+            "gemini_key": bool(GEMINI_API_KEY),
+            "secret": bool(STAGED_SECRET)}
 
 
-@app.post("/analyze")
-async def analyze(
-    background_tasks: BackgroundTasks,
-    photos: list[UploadFile] = File(...),
-    budget: int = Form(...),
-    style: str = Form(...),
-    location: str = Form(...),
-    destination: str = Form(...),
-    email: str = Form(...),
-):
-    if not photos:
-        raise HTTPException(status_code=400, detail="Almeno una foto è richiesta")
-    if len(photos) > 10:
-        raise HTTPException(status_code=400, detail="Massimo 10 foto")
+@app.post("/gemini-analyze")
+async def gemini_analyze(req: GeminiReq, request: Request):
+    """Main analysis — consumes 1 credit. Gemini key stays server-side."""
+    verify_token(request)
+    uid = request.headers.get("X-User-UID", "")
+    if req.consume_credit:
+        consume_credit(uid)
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY non configurata.")
+    return await call_gemini(req.model, req.payload)
 
-    photo_data = []
-    for photo in photos:
-        content = await photo.read()
-        photo_data.append({
-            "content": content,
-            "filename": photo.filename,
-            "content_type": photo.content_type or "image/jpeg",
-        })
 
-    validation = await validate_input_photos(photo_data)
-    invalid_photos = [
-        {"index": i, "issue": validation["issues"][i], "suggestion": validation.get("suggestions", [""])[i]}
-        for i, ok in enumerate(validation["valid"])
-        if not ok
-    ]
-
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = {
-        "status": "processing",
-        "progress": 0,
-        "step": "Inizializzazione…",
-        "validation": {
-            "warnings":       validation.get("warnings", []),
-            "invalid_photos": invalid_photos,
-            "layout_hint":    validation.get("layout_hint", ""),
-        }
+@app.post("/gemini-translate")
+async def gemini_translate(req: TranslateReq, request: Request):
+    """Translation — no credit consumed."""
+    verify_token(request)
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY non configurata.")
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text":
+            f"Translate to English. Return ONLY the translation:\n\n{req.text}"
+        }]}],
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 2048}
     }
-
-    prefs = {
-        "budget":      budget,
-        "style":       style,
-        "location":    location,
-        "destination": destination,
-    }
-    background_tasks.add_task(_process_job, job_id, photo_data, prefs, email)
-    return {
-        "job_id":     job_id,
-        "validation": jobs[job_id]["validation"],
-    }
-
-
-@app.get("/status/{job_id}")
-def get_status(job_id: str):
-    job = jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job non trovato")
-    return job
-
-
-@app.post("/test-variant")
-async def test_variant(
-    photo: UploadFile = File(...),
-    prompt: str = Form(...),
-    negative_prompt: str = Form(""),
-    guidance_scale: float = Form(25.0),
-):
-    guidance_scale = min(float(guidance_scale), 30.0)
-    content = await photo.read()
-
+    data = await call_gemini("gemini-2.5-flash", payload, timeout=30.0)
     try:
-        compressed = compress_image(content, max_width=1024, quality=80)
-        client = _get_vertex_client()
-
-        response = client.models.edit_image(
-            model="imagen-3.0-capability-001",
-            prompt=prompt,
-            reference_images=[
-                genai_types.RawReferenceImage(
-                    reference_id=1,
-                    reference_image=genai_types.Image(image_bytes=compressed),
-                )
-            ],
-            config=genai_types.EditImageConfig(
-                edit_mode="EDIT_MODE_DEFAULT",
-                number_of_images=1,
-                guidance_scale=guidance_scale,
-                negative_prompt=negative_prompt or None,
-                safety_filter_level="block_only_high",
-            ),
-        )
-
-        if response.generated_images:
-            b64 = base64.b64encode(
-                response.generated_images[0].image.image_bytes
-            ).decode()
-            return {"success": True, "image_b64": b64, "guidance_used": guidance_scale}
-
-        return {
-            "success": False,
-            "error": f"Imagen ha restituito 0 immagini (guidance={guidance_scale}). Prova un valore <= 28.",
-        }
-
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[test-variant] ERRORE:\n{tb}")
-        return {"success": False, "error": f"{type(e).__name__}: {e}"}
-
-
-class StageImageRequest(BaseModel):
-    photo_b64: str
-    photo_mime: str
-    prompt: str
+        return {"translation": data["candidates"][0]["content"]["parts"][0]["text"]}
+    except (KeyError, IndexError):
+        raise HTTPException(status_code=500, detail="Risposta traduzione malformata.")
 
 
 @app.post("/stage-image")
-async def stage_image(req: StageImageRequest):
-    try:
-        photo_bytes = base64.b64decode(req.photo_b64)
-    except Exception:
-        raise HTTPException(status_code=400, detail="photo_b64 non valido")
+async def stage_image(req: StageImageReq, request: Request):
+    """Image generation — token verified, credit already consumed in /gemini-analyze."""
+    verify_token(request)
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY non configurata.")
 
-    from ai_service import _approach_single
-    loop = asyncio.get_running_loop()
-    try:
-        result_b64 = await loop.run_in_executor(
-            None, _approach_single, photo_bytes, req.prompt, 26, "DEMO"
-        )
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[stage-image] ERRORE:\n{tb}")
-        raise HTTPException(status_code=500, detail=f"Errore Imagen: {type(e).__name__}: {e}")
+    MODELS = [
+        "gemini-3.1-flash-image-preview",
+        "gemini-2.5-flash-image",
+        "gemini-2.0-flash-exp",
+    ]
+    payload = {
+        "contents": [{"parts": [
+            {"inline_data": {"mime_type": req.photo_mime, "data": req.photo_b64}},
+            {"text": req.prompt}
+        ]}],
+        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
+    }
+    last_err = ""
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        for model in MODELS:
+            url = f"{GEMINI_BASE}/{model}:generateContent?key={GEMINI_API_KEY}"
+            try:
+                resp = await client.post(url, json=payload,
+                                         headers={"Content-Type": "application/json"})
+                data = resp.json()
+                if "error" in data:
+                    last_err = f"{model}: {data['error'].get('message','')}"; continue
+                parts = (data.get("candidates",[{}])[0]
+                         .get("content",{}).get("parts",[]))
+                img = next((p for p in parts
+                            if (p.get("inline_data") or p.get("inlineData",{}))
+                               .get("mime_type","").startswith("image/")), None)
+                if not img:
+                    last_err = f"{model}: no image"; continue
+                id_ = img.get("inline_data") or img.get("inlineData",{})
+                return {"image_b64": id_.get("data",""),
+                        "mime": id_.get("mime_type","image/png"), "model": model}
+            except Exception as e:
+                last_err = f"{model}: {e}"
+    raise HTTPException(status_code=500, detail=f"Immagine fallita: {last_err}")
 
-    if not result_b64:
-        raise HTTPException(status_code=500, detail="Imagen ha restituito 0 immagini — controlla i log Cloud Run")
 
-    return {"image_b64": result_b64}
-
-
-async def _process_job(job_id: str, photos: list, prefs: dict, email: str):
-    def update(progress: int, step: str):
-        jobs[job_id].update({"progress": progress, "step": step})
-
-    try:
-        update(10, "Gemini analizza le foto (spatial anchor + style DNA)…")
-        analysis = await analyze_with_gemini(photos, prefs)
-
-        update(35, "Imagen 3 genera D + E (KitchenBrutalistProtocol attivo)…")
-        staged_results = await generate_staged_photos(photos, analysis, prefs)
-
-        update(80, "Generazione PDF…")
-        pdf_bytes = generate_pdf(analysis, prefs, photos, staged_results=staged_results)
-
-        update(92, "Invio email…")
-        send_report_email(email, pdf_bytes, analysis, prefs)
-
-        jobs[job_id] = {
-            "status":   "completed",
-            "progress": 100,
-            "step":     "Completato",
-            "summary": {
-                "titolo":       analysis.get("titolo_annuncio_suggerito", ""),
-                "totale_costi": analysis.get("riepilogo_costi", {}).get("totale", 0),
-                "incremento":   analysis.get("tariffe", {}).get("incremento_percentuale", ""),
-                "spatial_map":  analysis.get("spatial_map", {}),
-            },
-            "validation": jobs[job_id].get("validation", {}),
-        }
-
-    except Exception as exc:
-        tb = traceback.format_exc()
-        print(tb)
-        jobs[job_id] = {
-            "status":    "error",
-            "progress":  0,
-            "step":      "Errore",
-            "error":     f"{type(exc).__name__}: {exc}",
-            "traceback": tb,
-            "validation": jobs[job_id].get("validation", {}),
-        }
+@app.post("/gemini-products")
+async def gemini_products(req: GeminiReq, request: Request):
+    """Product suggestions — no credit consumed."""
+    verify_token(request)
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY non configurata.")
+    req.consume_credit = False
+    return await call_gemini(req.model, req.payload, timeout=30.0)
