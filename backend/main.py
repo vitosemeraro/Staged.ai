@@ -6,6 +6,7 @@ import traceback
 import uuid
 import asyncio
 import os
+import base64
 import httpx
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,9 +45,23 @@ def health():
     return {"status": "ok"}
 
 
-# ── Gemini text proxy ─────────────────────────────────────────────────────────
-# Replaces direct frontend calls to generativelanguage.googleapis.com
-# Key never leaves the server.
+@app.post("/proxy-image")
+async def proxy_image(request: Request):
+    """Fetch a Firebase Storage image server-side and return as base64.
+    Solves CORS issues when loading Storage images in browser canvas."""
+    _check_token(request)
+    body = await request.json()
+    url = body.get("url", "")
+    if not url or not url.startswith("https://"):
+        raise HTTPException(status_code=400, detail="Invalid URL")
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(url)
+    if not r.is_success:
+        raise HTTPException(status_code=r.status_code, detail="Failed to fetch image")
+    b64_data = base64.b64encode(r.content).decode()
+    mime = r.headers.get("content-type", "image/jpeg").split(";")[0]
+    return {"b64": b64_data, "mime": mime}
+
 
 @app.post("/gemini-analyze")
 async def gemini_analyze(request: Request):
@@ -97,14 +112,13 @@ async def gemini_translate(request: Request):
 
 @app.post("/stage-image")
 async def stage_image(request: Request):
-    """Proxy for Gemini image generation (gemini-3.1-flash-image-preview etc.)."""
+    """Proxy for Gemini image generation."""
     _check_token(request)
     body = await request.json()
     model   = body.get("model", "gemini-3.1-flash-image-preview")
     payload = body.get("payload", {})
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured")
-    # Use v1beta for image generation models
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
            f"{model}:generateContent?key={GEMINI_API_KEY}")
     async with httpx.AsyncClient(timeout=120.0) as client:
@@ -172,9 +186,6 @@ async def _process_job(job_id: str, photos: list, prefs: dict, email: str):
         staged_results = await generate_staged_photos(photos, analysis)
 
         update(70, "Compilazione scheda…")
-        # staged_results è ora una lista di dict con chiavi A_base, B_geometric, C_reference, D_edit
-        # Non serve più attaccare staged_photo_b64 alle stanze — lo fa generate_pdf
-
         update(80, "Generazione PDF…")
         pdf_bytes = generate_pdf(analysis, prefs, photos, staged_results=staged_results)
 
@@ -193,13 +204,12 @@ async def _process_job(job_id: str, photos: list, prefs: dict, email: str):
         }
 
     except Exception as exc:
-        # Traceback completo salvato nel job — visibile nel frontend per debug
         tb = traceback.format_exc()
-        print(tb)  # anche nei log Cloud Run
+        print(tb)
         jobs[job_id] = {
             "status": "error",
             "progress": 0,
             "step": "Errore",
             "error": f"{type(exc).__name__}: {exc}",
-            "traceback": tb,  # ← NUOVO: traceback completo
+            "traceback": tb,
         }
